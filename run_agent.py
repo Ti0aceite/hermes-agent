@@ -3969,8 +3969,17 @@ class AIAgent:
             )
 
             # Resolve reasoning effort: config > default (medium)
+            # Models that do not support reasoning/encrypted_content.
+            _NON_REASONING_MODELS = {
+                "gpt-4.1-mini",
+                "gpt-4.1-nano",
+                "gpt-4.1",
+                "gpt-4o",
+                "gpt-4o-mini",
+                "gpt-3.5-turbo",
+            }
             reasoning_effort = "medium"
-            reasoning_enabled = True
+            reasoning_enabled = self.model not in _NON_REASONING_MODELS
             if self.reasoning_config and isinstance(self.reasoning_config, dict):
                 if self.reasoning_config.get("enabled") is False:
                     reasoning_enabled = False
@@ -3983,7 +3992,7 @@ class AIAgent:
                 "input": self._chat_messages_to_responses_input(payload_messages),
                 "tools": self._responses_tools(),
                 "tool_choice": "auto",
-                "parallel_tool_calls": True,
+                "parallel_tool_calls": False,
                 "store": False,
             }
 
@@ -4064,6 +4073,7 @@ class AIAgent:
             "messages": sanitized_messages,
             "tools": self.tools if self.tools else None,
             "timeout": float(os.getenv("HERMES_API_TIMEOUT", 900.0)),
+            "parallel_tool_calls": False,
         }
 
         if self.max_tokens is not None:

@@ -64,6 +64,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from agent.auxiliary_client import call_llm
 
 try:
@@ -409,7 +410,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). For links with a navigable href, Hermes automatically treats the click as navigation and may return the new page's URL, title, and snapshot. The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -945,6 +946,60 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
     return snapshot_text[:max_chars] + "\n\n[... content truncated ...]"
 
 
+def _normalize_browser_ref(ref: str) -> str:
+    """Normalize snapshot refs so browser commands always receive @eN."""
+    return ref if ref.startswith("@") else f"@{ref}"
+
+
+def _get_browser_attribute(task_id: str, ref: str, attribute: str) -> Optional[str]:
+    """Read an element attribute via agent-browser and return a stripped value."""
+    result = _run_browser_command(task_id, "getattribute", [ref, attribute])
+    if not result.get("success"):
+        return None
+
+    data = result.get("data", {})
+    value = data.get("value")
+    if value is None:
+        return None
+
+    value_str = str(value).strip()
+    return value_str or None
+
+
+def _is_navigable_href(href: Optional[str]) -> bool:
+    """Return True when an href should be treated as full-page navigation."""
+    if not href:
+        return False
+
+    lowered = href.strip().lower()
+    if not lowered:
+        return False
+
+    blocked_prefixes = ("#", "javascript:", "mailto:", "tel:")
+    return not lowered.startswith(blocked_prefixes)
+
+
+def _resolve_click_navigation_url(task_id: str, ref: str) -> Optional[str]:
+    """Resolve a clicked link ref into an absolute URL when safe to navigate."""
+    href = _get_browser_attribute(task_id, ref, "href")
+    if not _is_navigable_href(href):
+        return None
+
+    parsed = urlparse(href)
+    if parsed.scheme:
+        return href
+
+    current_url_result = _run_browser_command(task_id, "url", [])
+    if not current_url_result.get("success"):
+        return None
+
+    current_url = str(current_url_result.get("data", {}).get("url") or "").strip()
+    if not current_url:
+        return None
+
+    return urljoin(current_url, href)
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -1022,6 +1077,21 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     "Consider upgrading Browserbase plan for proxy support."
                 )
             response["stealth_features"] = active_features
+
+        # Auto-snapshot: include compact page snapshot after successful navigation
+        # so the model always receives element refs without a separate snapshot call.
+        try:
+            snap_result = _run_browser_command(effective_task_id, "snapshot", ["-c"])
+            if snap_result.get("success"):
+                snap_data = snap_result.get("data", {})
+                snapshot_text = snap_data.get("snapshot", "")
+                refs = snap_data.get("refs", {})
+                if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+                    snapshot_text = snapshot_text[:SNAPSHOT_SUMMARIZE_THRESHOLD] + "\n[...truncated]"
+                response["snapshot"] = snapshot_text
+                response["element_count"] = len(refs) if isinstance(refs, dict) else 0
+        except Exception:
+            pass  # Navigation succeeded even if snapshot fails.
         
         return json.dumps(response, ensure_ascii=False)
     else:
@@ -1093,11 +1163,23 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         JSON string with click result
     """
     effective_task_id = task_id or "default"
-    
-    # Ensure ref starts with @
-    if not ref.startswith("@"):
-        ref = f"@{ref}"
-    
+
+    ref = _normalize_browser_ref(ref)
+
+    target_url = _resolve_click_navigation_url(effective_task_id, ref)
+    if target_url:
+        navigation_result = browser_navigate(target_url, task_id=effective_task_id)
+        try:
+            navigation_data = json.loads(navigation_result)
+        except json.JSONDecodeError:
+            return navigation_result
+
+        if navigation_data.get("success"):
+            navigation_data["clicked"] = ref
+            navigation_data["navigated"] = True
+
+        return json.dumps(navigation_data, ensure_ascii=False)
+
     result = _run_browser_command(effective_task_id, "click", [ref])
     
     if result.get("success"):
