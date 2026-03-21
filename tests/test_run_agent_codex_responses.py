@@ -257,7 +257,7 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "function" not in kwargs["tools"][0]
     assert kwargs["store"] is False
     assert kwargs["tool_choice"] == "auto"
-    assert kwargs["parallel_tool_calls"] is True
+    assert kwargs["parallel_tool_calls"] is False
     assert isinstance(kwargs["prompt_cache_key"], str)
     assert len(kwargs["prompt_cache_key"]) > 0
     assert "timeout" not in kwargs
@@ -272,7 +272,7 @@ def test_build_api_kwargs_copilot_responses_omits_openai_only_fields(monkeypatch
     assert kwargs["model"] == "gpt-5.4"
     assert kwargs["store"] is False
     assert kwargs["tool_choice"] == "auto"
-    assert kwargs["parallel_tool_calls"] is True
+    assert kwargs["parallel_tool_calls"] is False
     assert kwargs["reasoning"] == {"effort": "medium"}
     assert "prompt_cache_key" not in kwargs
     assert "include" not in kwargs
