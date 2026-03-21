@@ -145,6 +145,11 @@ Snapshots over 8000 characters are automatically summarized by an LLM.
 
 Click an element identified by its ref ID from the snapshot.
 
+If the ref points to a standard link with a real `href`, Hermes treats the
+click as navigation internally and returns the destination page metadata just
+like `browser_navigate`. Hash links and `javascript:` links still use a normal
+click.
+
 ```
 Click @e5 to press the "Sign In" button
 ```
