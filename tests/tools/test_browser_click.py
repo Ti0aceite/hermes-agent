@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 class TestBrowserClickLinkNavigation:
-    def test_relative_href_uses_browser_navigate(self):
+    def test_relative_href_from_snapshot_uses_browser_navigate(self):
         from tools.browser_tool import browser_click
 
         navigate_response = json.dumps(
@@ -25,12 +25,15 @@ class TestBrowserClickLinkNavigation:
 
         with (
             patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool._get_session_info", return_value={"last_url": "https://app.dentidesk.cl/"}),
             patch("tools.browser_tool.browser_navigate", return_value=navigate_response) as mock_nav,
         ):
-            mock_cmd.side_effect = [
-                {"success": True, "data": {"attribute": "href", "value": "reportes.php"}},
-                {"success": True, "data": {"url": "https://app.dentidesk.cl/home.php"}},
-            ]
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "snapshot": '  - link "Reportes" [ref=e7]:\n    - /url: reportes.php',
+                },
+            }
 
             result = json.loads(browser_click("@e7", task_id="dentidesk"))
 
@@ -38,16 +41,13 @@ class TestBrowserClickLinkNavigation:
             "https://app.dentidesk.cl/reportes.php",
             task_id="dentidesk",
         )
-        assert mock_cmd.call_args_list == [
-            call("dentidesk", "getattribute", ["@e7", "href"]),
-            call("dentidesk", "url", []),
-        ]
+        mock_cmd.assert_called_once_with("dentidesk", "snapshot", ["-c"])
         assert result["success"] is True
         assert result["clicked"] == "@e7"
         assert result["navigated"] is True
         assert result["snapshot"] == '- heading "Reportes"'
 
-    def test_absolute_href_uses_browser_navigate_without_url_lookup(self):
+    def test_absolute_href_from_snapshot_uses_browser_navigate(self):
         from tools.browser_tool import browser_click
 
         navigate_response = json.dumps(
@@ -61,8 +61,7 @@ class TestBrowserClickLinkNavigation:
             mock_cmd.return_value = {
                 "success": True,
                 "data": {
-                    "attribute": "href",
-                    "value": "https://app.dentidesk.cl/reportes.php",
+                    "snapshot": '  - link "Reportes" [ref=e7]:\n    - /url: https://app.dentidesk.cl/reportes.php',
                 },
             }
 
@@ -72,7 +71,7 @@ class TestBrowserClickLinkNavigation:
             "https://app.dentidesk.cl/reportes.php",
             task_id="dentidesk",
         )
-        mock_cmd.assert_called_once_with("dentidesk", "getattribute", ["@e7", "href"])
+        mock_cmd.assert_called_once_with("dentidesk", "snapshot", ["-c"])
         assert result["clicked"] == "@e7"
         assert result["navigated"] is True
 
@@ -84,7 +83,7 @@ class TestBrowserClickLinkNavigation:
             patch("tools.browser_tool.browser_navigate") as mock_nav,
         ):
             mock_cmd.side_effect = [
-                {"success": True, "data": {"attribute": "href", "value": "#reports"}},
+                {"success": True, "data": {"snapshot": '  - link "Reportes" [ref=e7]:\n    - /url: "#reports"'}},
                 {"success": True},
             ]
 
@@ -92,7 +91,7 @@ class TestBrowserClickLinkNavigation:
 
         mock_nav.assert_not_called()
         assert mock_cmd.call_args_list == [
-            call("dentidesk", "getattribute", ["@e7", "href"]),
+            call("dentidesk", "snapshot", ["-c"]),
             call("dentidesk", "click", ["@e7"]),
         ]
         assert result == {"success": True, "clicked": "@e7"}
@@ -105,7 +104,10 @@ class TestBrowserClickLinkNavigation:
             patch("tools.browser_tool.browser_navigate") as mock_nav,
         ):
             mock_cmd.side_effect = [
-                {"success": True, "data": {"attribute": "href", "value": "javascript:void(0)"}},
+                {
+                    "success": True,
+                    "data": {"snapshot": '  - link "Reportes" [ref=e7]:\n    - /url: "javascript:void(0)"'},
+                },
                 {"success": True},
             ]
 
@@ -113,12 +115,12 @@ class TestBrowserClickLinkNavigation:
 
         mock_nav.assert_not_called()
         assert mock_cmd.call_args_list == [
-            call("dentidesk", "getattribute", ["@e7", "href"]),
+            call("dentidesk", "snapshot", ["-c"]),
             call("dentidesk", "click", ["@e7"]),
         ]
         assert result == {"success": True, "clicked": "@e7"}
 
-    def test_getattribute_failure_falls_back_to_click(self):
+    def test_snapshot_failure_falls_back_to_getattribute_then_click(self):
         from tools.browser_tool import browser_click
 
         with (
@@ -127,6 +129,7 @@ class TestBrowserClickLinkNavigation:
         ):
             mock_cmd.side_effect = [
                 {"success": False, "error": "No ref map"},
+                {"success": False, "error": "No ref map"},
                 {"success": True},
             ]
 
@@ -134,33 +137,41 @@ class TestBrowserClickLinkNavigation:
 
         mock_nav.assert_not_called()
         assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
             call("dentidesk", "getattribute", ["@e7", "href"]),
             call("dentidesk", "click", ["@e7"]),
         ]
         assert result == {"success": True, "clicked": "@e7"}
 
-    def test_relative_href_without_current_url_falls_back_to_click(self):
+    def test_relative_href_without_session_url_uses_runtime_url_lookup(self):
         from tools.browser_tool import browser_click
+
+        navigate_response = json.dumps(
+            {"success": True, "url": "https://app.dentidesk.cl/reportes.php", "title": "Reportes"}
+        )
 
         with (
             patch("tools.browser_tool._run_browser_command") as mock_cmd,
-            patch("tools.browser_tool.browser_navigate") as mock_nav,
+            patch("tools.browser_tool._get_session_info", return_value={}),
+            patch("tools.browser_tool.browser_navigate", return_value=navigate_response) as mock_nav,
         ):
             mock_cmd.side_effect = [
-                {"success": True, "data": {"attribute": "href", "value": "reportes.php"}},
-                {"success": False, "error": "No page"},
-                {"success": True},
+                {"success": True, "data": {"snapshot": '  - link "Reportes" [ref=e7]:\n    - /url: reportes.php'}},
+                {"success": True, "data": {"url": "https://app.dentidesk.cl/home.php"}},
             ]
 
             result = json.loads(browser_click("@e7", task_id="dentidesk"))
 
-        mock_nav.assert_not_called()
+        mock_nav.assert_called_once_with(
+            "https://app.dentidesk.cl/reportes.php",
+            task_id="dentidesk",
+        )
         assert mock_cmd.call_args_list == [
-            call("dentidesk", "getattribute", ["@e7", "href"]),
+            call("dentidesk", "snapshot", ["-c"]),
             call("dentidesk", "url", []),
-            call("dentidesk", "click", ["@e7"]),
         ]
-        assert result == {"success": True, "clicked": "@e7"}
+        assert result["success"] is True
+        assert result["navigated"] is True
 
 
 class TestBrowserNavigateAutoSnapshot:

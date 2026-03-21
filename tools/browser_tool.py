@@ -966,6 +966,47 @@ def _get_browser_attribute(task_id: str, ref: str, attribute: str) -> Optional[s
     return value_str or None
 
 
+def _get_snapshot_href(task_id: str, ref: str) -> Optional[str]:
+    """Resolve a link href from the current compact snapshot tree."""
+    result = _run_browser_command(task_id, "snapshot", ["-c"])
+    if not result.get("success"):
+        return None
+
+    snapshot_text = str(result.get("data", {}).get("snapshot") or "")
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref[1:] if ref.startswith("@") else ref
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_ref)}\](?::)?(?:\s.*)?$"
+    )
+    url_pattern = re.compile(r'^\s*-\s+/url:\s+"?(?P<url>[^"\n]+)"?\s*$')
+    lines = snapshot_text.splitlines()
+
+    for idx, line in enumerate(lines):
+        match = ref_pattern.match(line)
+        if not match:
+            continue
+
+        base_indent = len(match.group("indent"))
+        for child_line in lines[idx + 1:]:
+            if not child_line.strip():
+                continue
+
+            child_indent = len(child_line) - len(child_line.lstrip(" "))
+            if child_indent <= base_indent:
+                break
+
+            url_match = url_pattern.match(child_line)
+            if url_match:
+                href = url_match.group("url").strip()
+                return href or None
+
+        break
+
+    return None
+
+
 def _is_navigable_href(href: Optional[str]) -> bool:
     """Return True when an href should be treated as full-page navigation."""
     if not href:
@@ -981,7 +1022,9 @@ def _is_navigable_href(href: Optional[str]) -> bool:
 
 def _resolve_click_navigation_url(task_id: str, ref: str) -> Optional[str]:
     """Resolve a clicked link ref into an absolute URL when safe to navigate."""
-    href = _get_browser_attribute(task_id, ref, "href")
+    href = _get_snapshot_href(task_id, ref)
+    if href is None:
+        href = _get_browser_attribute(task_id, ref, "href")
     if not _is_navigable_href(href):
         return None
 
@@ -989,11 +1032,17 @@ def _resolve_click_navigation_url(task_id: str, ref: str) -> Optional[str]:
     if parsed.scheme:
         return href
 
-    current_url_result = _run_browser_command(task_id, "url", [])
-    if not current_url_result.get("success"):
-        return None
+    session_info = _get_session_info(task_id)
+    current_url = str(session_info.get("last_url") or "").strip()
 
-    current_url = str(current_url_result.get("data", {}).get("url") or "").strip()
+    if not current_url:
+        current_url_result = _run_browser_command(task_id, "url", [])
+        if not current_url_result.get("success"):
+            return None
+        current_url = str(current_url_result.get("data", {}).get("url") or "").strip()
+        if current_url:
+            session_info["last_url"] = current_url
+
     if not current_url:
         return None
 
@@ -1042,6 +1091,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         data = result.get("data", {})
         title = data.get("title", "")
         final_url = data.get("url", url)
+        session_info["last_url"] = final_url
         
         response = {
             "success": True,
