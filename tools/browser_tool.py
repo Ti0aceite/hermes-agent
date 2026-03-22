@@ -96,6 +96,11 @@ DEFAULT_SESSION_TIMEOUT = 300
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 
+# Dependent dropdowns in apps like Dentidesk sometimes populate a moment after
+# the first select fires its change event. Wait briefly before giving up.
+SELECT_OPTION_WAIT_TIMEOUT = 5.0
+SELECT_OPTION_POLL_INTERVAL = 0.25
+
 
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
@@ -1457,6 +1462,106 @@ def _select_via_eval(
     }
 
 
+def _parse_eval_result_dict(raw_result: Any) -> Optional[Dict[str, Any]]:
+    """Normalize an eval command result into a dictionary when possible."""
+    if isinstance(raw_result, dict):
+        return raw_result
+
+    if isinstance(raw_result, str):
+        try:
+            parsed = json.loads(raw_result)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
+
+
+def _build_select_option_probe_script(
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build a DOM probe that checks whether a target option is selectable yet."""
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if dom_index is None:
+        return None
+
+    target_value = json.dumps(selected_value)
+
+    return f"""(() => {{
+  const selects = Array.from(document.querySelectorAll("select"));
+  const selectEl = selects[{dom_index}] || null;
+  if (!selectEl) {{
+    return JSON.stringify({{
+      success: false,
+      ready: false,
+      error: "Select element not found while waiting for option."
+    }});
+  }}
+
+  const targetValue = {target_value};
+  const options = Array.from(selectEl.options || []);
+  const matchedOption =
+    options.find(option => String(option.value) === targetValue) ||
+    options.find(option => (option.textContent || "").trim() === targetValue);
+
+  return JSON.stringify({{
+    success: true,
+    ready: Boolean(matchedOption) && !selectEl.disabled,
+    disabled: Boolean(selectEl.disabled),
+    matched_value: matchedOption ? String(matchedOption.value || "") : null,
+    matched_text: matchedOption ? (matchedOption.textContent || "").trim() : null,
+    option_count: options.length
+  }});
+}})()"""
+
+
+def _wait_for_select_option(
+    task_id: str,
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+    timeout_seconds: float = SELECT_OPTION_WAIT_TIMEOUT,
+) -> Dict[str, Any]:
+    """Wait briefly for a dependent dropdown option to become selectable."""
+    script = _build_select_option_probe_script(
+        ref,
+        selected_value,
+        snapshot_result=snapshot_result,
+    )
+    if not script:
+        return {"success": False, "ready": False, "error": "No stable select index available."}
+
+    deadline = time.time() + max(0.0, timeout_seconds)
+    last_result: Dict[str, Any] = {
+        "success": False,
+        "ready": False,
+        "error": "Timed out waiting for select option.",
+    }
+
+    while True:
+        probe = _run_browser_command(task_id, "eval", [script])
+        if not probe.get("success"):
+            last_result = {
+                "success": False,
+                "ready": False,
+                "error": probe.get("error", "Select readiness probe failed."),
+            }
+        else:
+            parsed = _parse_eval_result_dict(probe.get("data", {}).get("result")) or {}
+            if parsed:
+                last_result = parsed
+                if parsed.get("ready"):
+                    return parsed
+
+        if time.time() >= deadline:
+            return last_result
+
+        time.sleep(SELECT_OPTION_POLL_INTERVAL)
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -1704,7 +1809,7 @@ def browser_select(
             str(option_ref).strip(),
             snapshot_result=snapshot_result,
         ) or ""
-    elif selected_value:
+    if selected_value:
         selected_value = _resolve_select_value_from_label(
             effective_task_id,
             ref,
@@ -1717,6 +1822,18 @@ def browser_select(
             "success": False,
             "error": "Could not resolve the requested option from the current snapshot."
         }, ensure_ascii=False)
+
+    snapshot_text = _snapshot_text(snapshot_result)
+    if snapshot_text.count("combobox") > 1:
+        wait_result = _wait_for_select_option(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
+        matched_value = str(wait_result.get("matched_value") or "").strip()
+        if matched_value:
+            selected_value = matched_value
 
     result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
     fallback_snapshot = snapshot_result
