@@ -225,6 +225,7 @@ class TestBrowserSelect:
                         "snapshot": '  - combobox "Color" [ref=e1]:\n    - option "Blue" [ref=e9]',
                     },
                 },
+                {"success": True, "data": {"value": None}},
                 {"success": True},
             ]
 
@@ -232,9 +233,39 @@ class TestBrowserSelect:
 
         assert mock_cmd.call_args_list == [
             call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e9", "value"]),
             call("dentidesk", "select", ["@e1", "Blue"]),
         ]
         assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
+    def test_select_with_value_resolves_real_option_value_from_snapshot_label(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e22]:\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                    },
+                },
+                {"success": True, "data": {"value": "estado_horas"}},
+                {"success": True},
+            ]
+
+            result = json.loads(
+                browser_select("@e22", value="Reporte por estado de citas", task_id="dentidesk")
+            )
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "select", ["@e22", "estado_horas"]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
 
     def test_select_with_option_ref_resolves_value_from_snapshot(self):
         from tools.browser_tool import browser_select

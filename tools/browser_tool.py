@@ -1132,6 +1132,63 @@ def _resolve_select_option_value(
     )
 
 
+def _resolve_select_value_from_label(
+    task_id: str,
+    select_ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Translate visible option text into its real value when possible."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return selected_value
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    if not snapshot_text:
+        return selected_value
+
+    normalized_select_ref = select_ref[1:] if select_ref.startswith("@") else select_ref
+    lines = snapshot_text.splitlines()
+    target_label = selected_value.strip()
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_select_ref)}\](?::)?(?:\s.*)?$"
+    )
+    option_ref_pattern = re.compile(r"\[ref=(e\d+)\]")
+
+    for idx, line in enumerate(lines):
+        match = ref_pattern.match(line)
+        if not match:
+            continue
+
+        base_indent = len(match.group("indent"))
+        for child_line in lines[idx + 1:]:
+            if not child_line.strip():
+                continue
+
+            child_indent = len(child_line) - len(child_line.lstrip(" "))
+            if child_indent <= base_indent:
+                break
+
+            if "option" not in child_line:
+                continue
+
+            option_ref_match = option_ref_pattern.search(child_line)
+            if not option_ref_match:
+                continue
+
+            option_label = _extract_snapshot_line_text(child_line)
+            if option_label != target_label:
+                continue
+
+            option_ref = "@" + option_ref_match.group(1)
+            resolved_value = _get_browser_attribute(task_id, option_ref, "value")
+            return resolved_value or selected_value
+
+        break
+
+    return selected_value
+
+
 def _resolve_combobox_selector(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Resolve a combobox ref to a stable Playwright locator string."""
     effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
@@ -1647,6 +1704,13 @@ def browser_select(
             str(option_ref).strip(),
             snapshot_result=snapshot_result,
         ) or ""
+    elif selected_value:
+        selected_value = _resolve_select_value_from_label(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
 
     if not selected_value:
         return json.dumps({
