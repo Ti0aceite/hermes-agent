@@ -33,6 +33,18 @@ def test_browser_click_row_detail_schema_is_openai_compatible():
     assert params["required"] == ["row_text"]
 
 
+def test_browser_extract_visible_table_schema_is_openai_compatible():
+    from tools.browser_tool import _BROWSER_SCHEMA_MAP
+
+    params = _BROWSER_SCHEMA_MAP["browser_extract_visible_table"]["parameters"]
+
+    assert params["type"] == "object"
+    assert "oneOf" not in params
+    assert "anyOf" not in params
+    assert "allOf" not in params
+    assert params["required"] == []
+
+
 class TestBrowserClickLinkNavigation:
     def test_relative_href_from_snapshot_uses_browser_navigate(self):
         from tools.browser_tool import browser_click
@@ -385,6 +397,76 @@ class TestBrowserClickRowDetail:
 
         assert result["success"] is False
         assert "No clickable detail control found" in result["error"]
+
+    def test_extract_visible_table_returns_structured_rows(self):
+        from tools.browser_tool import browser_extract_visible_table
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": True,
+                            "heading_text": "Detalle estado Confirmo y no asistió",
+                            "headers": ["Nombre Paciente", "Fecha", "Hora"],
+                            "rows": [
+                                {
+                                    "Nombre Paciente": "AGUERO SOTO SILVIA VANESA",
+                                    "Fecha": "21/03/2026",
+                                    "Hora": "14:10",
+                                },
+                                {
+                                    "Nombre Paciente": "Belen Almonacid Martel Diana",
+                                    "Fecha": "21/03/2026",
+                                    "Hora": "09:10",
+                                },
+                            ],
+                            "row_count": 2,
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_extract_visible_table(
+                    heading_text="Detalle estado Confirmo y no asistió",
+                    task_id="dentidesk",
+                )
+            )
+
+        assert mock_cmd.call_count == 1
+        assert mock_cmd.call_args[0][0] == "dentidesk"
+        assert mock_cmd.call_args[0][1] == "eval"
+        assert result["success"] is True
+        assert result["row_count"] == 2
+        assert result["rows"][0]["Nombre Paciente"] == "AGUERO SOTO SILVIA VANESA"
+
+    def test_extract_visible_table_returns_error_when_missing(self):
+        from tools.browser_tool import browser_extract_visible_table
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": False,
+                            "error": "No visible table found after heading \"detalle estado\".",
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_extract_visible_table(
+                    heading_text="Detalle estado",
+                    task_id="dentidesk",
+                )
+            )
+
+        assert result["success"] is False
+        assert "No visible table found" in result["error"]
 
     def test_select_with_option_ref_resolves_label_to_real_value_from_parent_select(self):
         from tools.browser_tool import browser_select

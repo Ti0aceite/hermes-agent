@@ -43,7 +43,7 @@ _HERMES_CORE_TOOLS = [
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click", "browser_select",
-    "browser_click_row_detail",
+    "browser_click_row_detail", "browser_extract_visible_table",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_close", "browser_get_images",
     "browser_vision", "browser_console",
@@ -118,7 +118,7 @@ TOOLSETS = {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
         "tools": [
             "browser_navigate", "browser_snapshot", "browser_click", "browser_select",
-            "browser_click_row_detail",
+            "browser_click_row_detail", "browser_extract_visible_table",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_close", "browser_get_images",
             "browser_vision", "browser_console", "web_search"
@@ -242,7 +242,7 @@ TOOLSETS = {
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_click_row_detail",
+            "browser_click_row_detail", "browser_extract_visible_table",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_close", "browser_get_images",
             "browser_vision", "browser_console",

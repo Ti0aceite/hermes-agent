@@ -464,6 +464,20 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_extract_visible_table",
+        "description": "Extract the currently visible table into structured headers and rows. Prefer heading_text when the page has multiple tables; Hermes will target the first visible table that follows that heading. Use this when browser_snapshot truncates long table content and you need every row.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "heading_text": {
+                    "type": "string",
+                    "description": "Optional heading text that identifies the table section to extract, for example 'Detalle estado Confirmo y no asistió'."
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "browser_type",
         "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
@@ -1753,6 +1767,177 @@ def _build_row_detail_click_script(row_text: str) -> str:
 }})()"""
 
 
+def _build_visible_table_extract_script(heading_text: Optional[str] = None) -> str:
+    """Build a DOM extraction script for a visible table near a heading."""
+    heading_text_json = json.dumps(heading_text or "")
+    return f"""(() => {{
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  const targetHeading = normalize({heading_text_json});
+
+  const isVisible = (el) => Boolean(
+    el &&
+    typeof el.getClientRects === "function" &&
+    el.getClientRects().length
+  );
+
+  const textOf = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+
+  const getRowCells = (row) => {{
+    const roleCells = Array.from(row.querySelectorAll(":scope > [role='cell'], :scope > [role='columnheader']"));
+    if (roleCells.length) {{
+      return roleCells;
+    }}
+    return Array.from(row.querySelectorAll(":scope > td, :scope > th"));
+  }};
+
+  const getRows = (tableEl) => {{
+    if (!tableEl) {{
+      return [];
+    }}
+    const rows = Array.from(tableEl.querySelectorAll("tr, [role='row']"))
+      .filter((row) => isVisible(row) && getRowCells(row).length);
+    if (rows.length) {{
+      return rows;
+    }}
+    if (isVisible(tableEl) && getRowCells(tableEl).length) {{
+      return [tableEl];
+    }}
+    return [];
+  }};
+
+  const extractTable = (tableEl, headingEl = null) => {{
+    const rows = getRows(tableEl);
+    if (!rows.length) {{
+      return null;
+    }}
+
+    let headerCells = [];
+    let dataRows = rows.slice();
+    for (const row of rows) {{
+      const cells = getRowCells(row);
+      const explicitHeaders = cells.filter((cell) =>
+        (cell.getAttribute && cell.getAttribute("role") === "columnheader") ||
+        String(cell.tagName || "").toLowerCase() === "th"
+      );
+      if (explicitHeaders.length) {{
+        headerCells = explicitHeaders;
+        dataRows = rows.filter((candidate) => candidate !== row);
+        break;
+      }}
+    }}
+
+    const visibleDataRows = dataRows.filter((row) => {{
+      const values = getRowCells(row).map((cell) => textOf(cell.innerText || cell.textContent));
+      return values.some(Boolean);
+    }});
+
+    const headerTexts = headerCells
+      .map((cell) => textOf(cell.innerText || cell.textContent))
+      .filter(Boolean);
+
+    const maxCellCount = visibleDataRows.reduce((maxCount, row) => {{
+      return Math.max(maxCount, getRowCells(row).length);
+    }}, headerTexts.length);
+
+    const headers = Array.from({{ length: maxCellCount }}, (_, index) =>
+      headerTexts[index] || `col_${{index + 1}}`
+    );
+
+    const structuredRows = visibleDataRows.map((row) => {{
+      const values = getRowCells(row)
+        .map((cell) => textOf(cell.innerText || cell.textContent))
+        .slice(0, headers.length);
+      const mapped = {{}};
+      headers.forEach((header, index) => {{
+        mapped[header] = values[index] || "";
+      }});
+      return mapped;
+    }});
+
+    return {{
+      success: true,
+      heading_text: headingEl ? textOf(headingEl.innerText || headingEl.textContent) : null,
+      headers,
+      rows: structuredRows,
+      row_count: structuredRows.length
+    }};
+  }};
+
+  const candidateElements = Array.from(document.querySelectorAll("table, [role='table'], tbody, [role='rowgroup']"));
+  const visibleCandidates = candidateElements.filter((element) => isVisible(element) && getRows(element).length);
+
+  const evaluateCandidate = (tableEl, headingEl = null) => {{
+    const extracted = extractTable(tableEl, headingEl);
+    if (!extracted || !extracted.row_count) {{
+      return null;
+    }}
+    return extracted;
+  }};
+
+  if (targetHeading) {{
+    const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6, [role='heading']"))
+      .filter((heading) => isVisible(heading))
+      .filter((heading) => normalize(heading.innerText || heading.textContent).includes(targetHeading));
+
+    for (const heading of headings) {{
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+      let node = walker.currentNode;
+      while (node && node !== heading) {{
+        node = walker.nextNode();
+      }}
+      while ((node = walker.nextNode())) {{
+        if (!(node instanceof Element) || !isVisible(node)) {{
+          continue;
+        }}
+        const directMatch = (
+          node.matches("table, [role='table'], tbody, [role='rowgroup']") ? node : null
+        );
+        const nestedMatch = directMatch || node.querySelector("table, [role='table'], tbody, [role='rowgroup']");
+        const candidate = nestedMatch && isVisible(nestedMatch) ? nestedMatch : null;
+        if (!candidate) {{
+          continue;
+        }}
+        const extracted = evaluateCandidate(candidate, heading);
+        if (extracted) {{
+          return JSON.stringify(extracted);
+        }}
+      }}
+    }}
+
+    return JSON.stringify({{
+      success: false,
+      error: `No visible table found after heading "${{targetHeading}}".`
+    }});
+  }}
+
+  let best = null;
+  for (const candidate of visibleCandidates) {{
+    const extracted = evaluateCandidate(candidate, null);
+    if (!extracted) {{
+      continue;
+    }}
+    if (!best || extracted.row_count > best.row_count) {{
+      best = extracted;
+    }}
+  }}
+
+  if (best) {{
+    return JSON.stringify(best);
+  }}
+
+  return JSON.stringify({{
+    success: false,
+    error: "No visible table found on the current page."
+  }});
+}})()"""
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -2122,6 +2307,39 @@ def browser_click_row_detail(row_text: str, task_id: Optional[str] = None) -> st
     return json.dumps({
         "success": False,
         "error": (parsed or {}).get("error", f"Failed to click detail for row {target_row}")
+    }, ensure_ascii=False)
+
+
+def browser_extract_visible_table(
+    heading_text: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Extract a visible table into structured headers and rows.
+
+    Args:
+        heading_text: Optional heading text used to locate the target table
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with structured table data
+    """
+    effective_task_id = task_id or "default"
+    script = _build_visible_table_extract_script(heading_text=heading_text)
+    result = _run_browser_command(effective_task_id, "eval", [script])
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Failed to extract visible table")
+        }, ensure_ascii=False)
+
+    parsed = _parse_eval_result_dict(result.get("data", {}).get("result"))
+    if parsed and parsed.get("success"):
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": (parsed or {}).get("error", "Failed to extract visible table")
     }, ensure_ascii=False)
 
 
@@ -2823,6 +3041,17 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🔎",
+)
+registry.register(
+    name="browser_extract_visible_table",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_extract_visible_table"],
+    handler=lambda args, **kw: browser_extract_visible_table(
+        heading_text=args.get("heading_text"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📋",
 )
 registry.register(
     name="browser_type",
