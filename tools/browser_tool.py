@@ -410,7 +410,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). For links with a navigable href, Hermes automatically treats the click as navigation and may return the new page's URL, title, and snapshot. The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). Hermes hydrates the current snapshot before clicking and retries once if the click fails because the ref/selector is stale or invalid. For links with a navigable href, Hermes automatically treats the click as navigation and may return the new page's URL, title, and snapshot. The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -420,6 +420,36 @@ BROWSER_TOOL_SCHEMAS = [
                 }
             },
             "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_select",
+        "description": "Select an option in a dropdown identified by its ref ID. Provide either value (the option label/value) or option_ref (a ref to an option from the snapshot). Hermes hydrates the current snapshot before selecting and resolves option_ref from the snapshot when needed. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The select element reference from the snapshot (e.g., '@e5')"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The option value to select"
+                },
+                "option_ref": {
+                    "type": "string",
+                    "description": "Reference to an option element in the snapshot (e.g., '@e9')"
+                }
+            },
+            "required": ["ref"],
+            "oneOf": [
+                {
+                    "required": ["value"]
+                },
+                {
+                    "required": ["option_ref"]
+                }
+            ]
         }
     },
     {
@@ -966,13 +996,132 @@ def _get_browser_attribute(task_id: str, ref: str, attribute: str) -> Optional[s
     return value_str or None
 
 
-def _get_snapshot_href(task_id: str, ref: str) -> Optional[str]:
+def _get_compact_snapshot(task_id: str) -> Dict[str, Any]:
+    """Fetch the current compact accessibility snapshot for a task."""
+    return _run_browser_command(task_id, "snapshot", ["-c"])
+
+
+def _snapshot_data(snapshot_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the snapshot payload if the command succeeded."""
+    if not snapshot_result.get("success"):
+        return {}
+
+    data = snapshot_result.get("data", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _snapshot_text(snapshot_result: Dict[str, Any]) -> str:
+    """Return the raw snapshot text from a snapshot command result."""
+    return str(_snapshot_data(snapshot_result).get("snapshot") or "")
+
+
+def _snapshot_refs(snapshot_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the refs map from a snapshot command result."""
+    refs = _snapshot_data(snapshot_result).get("refs", {})
+    return refs if isinstance(refs, dict) else {}
+
+
+def _extract_snapshot_ref_text(entry: Any) -> Optional[str]:
+    """Extract a usable label/value from a snapshot ref entry."""
+    if isinstance(entry, str):
+        value = entry.strip()
+        return value or None
+
+    if isinstance(entry, dict):
+        for key in ("value", "label", "text", "name", "title", "aria_label", "ariaLabel"):
+            value = entry.get(key)
+            if value is not None:
+                value_str = str(value).strip()
+                if value_str:
+                    return value_str
+
+    return None
+
+
+def _find_snapshot_ref_line(snapshot_text: str, ref: str) -> Optional[str]:
+    """Return the line in a snapshot that contains the requested ref."""
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref[1:] if ref.startswith("@") else ref
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_ref)}\](?::)?(?:\s.*)?$"
+    )
+    for line in snapshot_text.splitlines():
+        if ref_pattern.match(line):
+            return line
+    return None
+
+
+def _extract_snapshot_line_text(line: str) -> Optional[str]:
+    """Extract the most likely human-readable label from a snapshot line."""
+    if not line:
+        return None
+
+    quoted_values = re.findall(r'"([^"]+)"', line)
+    if quoted_values:
+        value = quoted_values[-1].strip()
+        return value or None
+
+    before_ref = line.split("[ref=", 1)[0]
+    before_ref = re.sub(r"^\s*-\s*", "", before_ref).strip()
+    before_ref = before_ref.rstrip(":").strip()
+    return before_ref or None
+
+
+def _resolve_snapshot_ref_text(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a ref to its human-readable text using the current snapshot."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return None
+
+    refs = _snapshot_refs(effective_snapshot)
+    normalized_ref = ref if ref.startswith("@") else f"@{ref}"
+    short_ref = normalized_ref[1:]
+
+    entry = None
+    for key in (normalized_ref, short_ref, ref):
+        if key in refs:
+            entry = refs[key]
+            break
+
+    text = _extract_snapshot_ref_text(entry)
+    if text:
+        return text
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    line = _find_snapshot_ref_line(snapshot_text, normalized_ref)
+    if not line:
+        return None
+
+    return _extract_snapshot_line_text(line)
+
+
+def _resolve_select_option_value(
+    task_id: str,
+    option_ref: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve an option ref to its form value, falling back to visible text."""
+    normalized_option_ref = _normalize_browser_ref(option_ref)
+    option_value = _get_browser_attribute(task_id, normalized_option_ref, "value")
+    if option_value is not None:
+        return option_value
+
+    return _resolve_snapshot_ref_text(
+        task_id,
+        normalized_option_ref,
+        snapshot_result=snapshot_result,
+    )
+
+
+def _get_snapshot_href(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Resolve a link href from the current compact snapshot tree."""
-    result = _run_browser_command(task_id, "snapshot", ["-c"])
+    result = snapshot_result or _get_compact_snapshot(task_id)
     if not result.get("success"):
         return None
 
-    snapshot_text = str(result.get("data", {}).get("snapshot") or "")
+    snapshot_text = _snapshot_text(result)
     if not snapshot_text:
         return None
 
@@ -1007,6 +1156,35 @@ def _get_snapshot_href(task_id: str, ref: str) -> Optional[str]:
     return None
 
 
+def _is_invalid_ref_or_selector_error(error: Optional[str]) -> bool:
+    """Return True for ref/selector errors that should trigger a retry."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    invalid_markers = (
+        "invalid ref",
+        "invalid selector",
+        "ref invalid",
+        "selector invalid",
+        "ref not found",
+        "selector not found",
+        "ref missing",
+        "selector missing",
+        "no ref map",
+        "stale element",
+        "element not found",
+        "node not found",
+        "could not find",
+        "unable to find",
+        "not attached",
+        "unsupported token",
+        "parsing css selector",
+        "css.escape",
+    )
+    return any(marker in lowered for marker in invalid_markers)
+
+
 def _is_navigable_href(href: Optional[str]) -> bool:
     """Return True when an href should be treated as full-page navigation."""
     if not href:
@@ -1020,9 +1198,13 @@ def _is_navigable_href(href: Optional[str]) -> bool:
     return not lowered.startswith(blocked_prefixes)
 
 
-def _resolve_click_navigation_url(task_id: str, ref: str) -> Optional[str]:
+def _resolve_click_navigation_url(
+    task_id: str,
+    ref: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Resolve a clicked link ref into an absolute URL when safe to navigate."""
-    href = _get_snapshot_href(task_id, ref)
+    href = _get_snapshot_href(task_id, ref, snapshot_result=snapshot_result)
     if href is None:
         href = _get_browser_attribute(task_id, ref, "href")
     if not _is_navigable_href(href):
@@ -1216,7 +1398,13 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
 
     ref = _normalize_browser_ref(ref)
 
-    target_url = _resolve_click_navigation_url(effective_task_id, ref)
+    snapshot_result = _get_compact_snapshot(effective_task_id)
+
+    target_url = _resolve_click_navigation_url(
+        effective_task_id,
+        ref,
+        snapshot_result=snapshot_result,
+    )
     if target_url:
         navigation_result = browser_navigate(target_url, task_id=effective_task_id)
         try:
@@ -1231,6 +1419,9 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps(navigation_data, ensure_ascii=False)
 
     result = _run_browser_command(effective_task_id, "click", [ref])
+    if not result.get("success") and _is_invalid_ref_or_selector_error(result.get("error")):
+        snapshot_result = _get_compact_snapshot(effective_task_id)
+        result = _run_browser_command(effective_task_id, "click", [ref])
     
     if result.get("success"):
         return json.dumps({
@@ -1242,6 +1433,74 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
             "success": False,
             "error": result.get("error", f"Failed to click {ref}")
         }, ensure_ascii=False)
+
+
+def browser_select(
+    ref: str,
+    value: Optional[str] = None,
+    option_ref: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Select an option in a dropdown.
+
+    Args:
+        ref: Select element reference (e.g., "@e5")
+        value: Option label/value to select
+        option_ref: Option element reference to resolve from the snapshot
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with select result
+    """
+    effective_task_id = task_id or "default"
+    ref = _normalize_browser_ref(ref)
+
+    has_value = bool(value and str(value).strip())
+    has_option_ref = bool(option_ref and str(option_ref).strip())
+    if has_value == has_option_ref:
+        return json.dumps({
+            "success": False,
+            "error": "Provide exactly one of 'value' or 'option_ref'."
+        }, ensure_ascii=False)
+
+    snapshot_result = _get_compact_snapshot(effective_task_id)
+    if not snapshot_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": snapshot_result.get("error", "Failed to hydrate browser snapshot")
+        }, ensure_ascii=False)
+
+    selected_value = str(value).strip() if has_value else ""
+    if has_option_ref:
+        selected_value = _resolve_select_option_value(
+            effective_task_id,
+            str(option_ref).strip(),
+            snapshot_result=snapshot_result,
+        ) or ""
+
+    if not selected_value:
+        return json.dumps({
+            "success": False,
+            "error": "Could not resolve the requested option from the current snapshot."
+        }, ensure_ascii=False)
+
+    result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
+    if not result.get("success") and _is_invalid_ref_or_selector_error(result.get("error")):
+        _get_compact_snapshot(effective_task_id)
+        result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
+
+    if result.get("success"):
+        return json.dumps({
+            "success": True,
+            "selected": selected_value,
+            "element": ref,
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": result.get("error", f"Failed to select {selected_value} in {ref}")
+    }, ensure_ascii=False)
 
 
 def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -1918,6 +2177,19 @@ registry.register(
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
+)
+registry.register(
+    name="browser_select",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_select"],
+    handler=lambda args, **kw: browser_select(
+        ref=args.get("ref", ""),
+        value=args.get("value"),
+        option_ref=args.get("option_ref"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🗂️",
 )
 registry.register(
     name="browser_type",

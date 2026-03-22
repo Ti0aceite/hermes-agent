@@ -173,6 +173,132 @@ class TestBrowserClickLinkNavigation:
         assert result["success"] is True
         assert result["navigated"] is True
 
+    def test_invalid_ref_selector_click_retries_after_refresh(self):
+        from tools.browser_tool import browser_click
+
+        with (
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool._get_browser_attribute", return_value=None),
+        ):
+            mock_cmd.side_effect = [
+                {"success": True, "data": {"snapshot": '  - button "Guardar" [ref=e7]'}},
+                {
+                    "success": False,
+                    "error": 'locator.click: Unsupported token "@e7" while parsing css selector "@e7"',
+                },
+                {"success": True, "data": {"snapshot": '  - button "Guardar" [ref=e7]'}},
+                {"success": True},
+            ]
+
+            result = json.loads(browser_click("@e7", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "click", ["@e7"]),
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "click", ["@e7"]),
+        ]
+        assert result == {"success": True, "clicked": "@e7"}
+
+
+class TestBrowserSelect:
+    def test_select_with_value_hydrates_snapshot_before_selecting(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": '  - combobox "Color" [ref=e1]:\n    - option "Blue" [ref=e9]',
+                    },
+                },
+                {"success": True},
+            ]
+
+            result = json.loads(browser_select("@e1", value="Blue", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["@e1", "Blue"]),
+        ]
+        assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
+    def test_select_with_option_ref_resolves_value_from_snapshot(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e1]:\n'
+                            '    - option "Reporte por estado de citas" [ref=e9]'
+                        ),
+                    },
+                },
+                {"success": True, "data": {"value": "estado_horas"}},
+                {"success": True},
+            ]
+
+            result = json.loads(browser_select("@e1", option_ref="@e9", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e9", "value"]),
+            call("dentidesk", "select", ["@e1", "estado_horas"]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e1"}
+
+    def test_select_with_option_ref_falls_back_to_snapshot_text(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": '  - combobox "Color" [ref=e1]:\n    - option "Blue" [ref=e9]',
+                    },
+                },
+                {"success": True, "data": {"value": None}},
+                {"success": True},
+            ]
+
+            result = json.loads(browser_select("@e1", option_ref="@e9", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e9", "value"]),
+            call("dentidesk", "select", ["@e1", "Blue"]),
+        ]
+        assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
+    def test_select_retries_after_invalid_ref_selector_error(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {"success": True, "data": {"snapshot": '  - combobox "Color" [ref=e1]'}},
+                {
+                    "success": False,
+                    "error": 'locator.selectOption: Unsupported token "@e1" while parsing css selector "@e1"',
+                },
+                {"success": True, "data": {"snapshot": '  - combobox "Color" [ref=e1]'}},
+                {"success": True},
+            ]
+
+            result = json.loads(browser_select("@e1", value="Blue", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["@e1", "Blue"]),
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["@e1", "Blue"]),
+        ]
+        assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
 
 class TestBrowserNavigateAutoSnapshot:
     def test_navigation_includes_compact_snapshot(self):
