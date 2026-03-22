@@ -140,6 +140,37 @@ def _sanitize_tool_argument_string_for_persistence(tool_name: str, raw_arguments
     return json.dumps(sanitized, ensure_ascii=False)
 
 
+def _sanitize_tool_output_for_persistence(raw_content: Any) -> Any:
+    """Redact sensitive snapshot-like fields in persisted tool outputs."""
+    if not isinstance(raw_content, str):
+        return raw_content
+    try:
+        parsed = json.loads(raw_content)
+    except Exception:
+        return raw_content
+    sanitized = _sanitize_tool_output_payload(parsed)
+    if sanitized is parsed:
+        return raw_content
+    return json.dumps(sanitized, ensure_ascii=False)
+
+
+def _sanitize_tool_output_payload(value: Any) -> Any:
+    """Recursively sanitize snapshot-like fields inside tool output payloads."""
+    if isinstance(value, list):
+        return [_sanitize_tool_output_payload(item) for item in value]
+
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"snapshot", "page_text", "html"} and isinstance(item, str):
+                sanitized[key] = redact_sensitive_text(item)
+            else:
+                sanitized[key] = _sanitize_tool_output_payload(item)
+        return sanitized
+
+    return value
+
+
 def _sanitize_persisted_payload(value: Any) -> Any:
     """Recursively sanitize payloads before persisting them to disk."""
     if isinstance(value, list):
@@ -160,6 +191,11 @@ def _sanitize_persisted_payload(value: Any) -> Any:
             sanitized["arguments"] = _sanitize_tool_argument_string_for_persistence(
                 sanitized["name"],
                 sanitized.get("arguments"),
+            )
+
+        if sanitized.get("role") == "tool":
+            sanitized["content"] = _sanitize_tool_output_for_persistence(
+                sanitized.get("content"),
             )
 
         if sanitized.get("role") == "system" and isinstance(sanitized.get("content"), str):

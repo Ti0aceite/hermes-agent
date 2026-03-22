@@ -88,6 +88,13 @@ _ENV_ASSIGN_RE_NAME = re.compile(
     re.IGNORECASE,
 )
 
+# Login identifier env vars that belong to application credentials, not generic
+# shell variables like USER/LOGNAME. Examples: DENTIDESK_USER, APP_LOGIN.
+_SCOPED_LOGIN_ENV_NAME_RE = re.compile(
+    r"^(?:[A-Z0-9]+_)+(?:USER|USERNAME|LOGIN|EMAIL)$",
+    re.IGNORECASE,
+)
+
 # Compile known prefix patterns into one alternation
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
@@ -156,7 +163,11 @@ def redact_sensitive_text(text: str) -> str:
 
     # Replace any exact env values whose variable names look secret-like.
     for env_key, env_val in os.environ.items():
-        if _ENV_ASSIGN_RE_NAME.search(env_key) and env_val and len(env_val) >= 4:
+        should_redact_value = (
+            _ENV_ASSIGN_RE_NAME.search(env_key)
+            or _SCOPED_LOGIN_ENV_NAME_RE.match(env_key)
+        )
+        if should_redact_value and env_val and len(env_val) >= 3:
             if env_val in text:
                 text = text.replace(env_val, "***")
 
