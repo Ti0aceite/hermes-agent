@@ -1844,6 +1844,21 @@ def browser_select(
                 ),
             }, ensure_ascii=False)
 
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if has_option_ref and wait_result and wait_result.get("ready") and dom_index not in (None, 0):
+        eval_result = _select_via_eval(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
+        if eval_result.get("success"):
+            return json.dumps({
+                "success": True,
+                "selected": selected_value,
+                "element": ref,
+            }, ensure_ascii=False)
+
     result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
     fallback_snapshot = snapshot_result
     if not result.get("success") and (

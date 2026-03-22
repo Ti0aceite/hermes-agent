@@ -389,11 +389,9 @@ class TestBrowserSelect:
                         "refs": {
                             "e17": {"name": "Tipo de reporte:", "role": "combobox"},
                             "e22": {"role": "combobox"},
-                            "e30": {"name": "Reporte por estado de citas", "role": "option"},
                         },
                     },
                 },
-                {"success": True, "data": {"value": "estado_horas"}},
                 {
                     "success": True,
                     "data": {
@@ -421,11 +419,10 @@ class TestBrowserSelect:
                 {"success": True},
             ]
 
-            result = json.loads(browser_select("@e22", option_ref="@e30", task_id="dentidesk"))
+            result = json.loads(browser_select("@e22", value="estado_horas", task_id="dentidesk"))
 
         assert mock_cmd.call_args_list == [
             call("dentidesk", "snapshot", ["-c"]),
-            call("dentidesk", "getattribute", ["@e30", "value"]),
             call("dentidesk", "eval", [ANY]),
             call("dentidesk", "select", ["@e22", "estado_horas"]),
             call("dentidesk", "snapshot", ["-c"]),
@@ -449,11 +446,9 @@ class TestBrowserSelect:
                         "refs": {
                             "e17": {"name": "Tipo de reporte:", "role": "combobox"},
                             "e22": {"role": "combobox"},
-                            "e30": {"name": "Reporte por estado de citas", "role": "option"},
                         },
                     },
                 },
-                {"success": True, "data": {"value": "estado_horas"}},
                 {
                     "success": True,
                     "data": {
@@ -490,15 +485,56 @@ class TestBrowserSelect:
                 },
             ]
 
+            result = json.loads(browser_select("@e22", value="estado_horas", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "eval", [ANY]),
+            call("dentidesk", "select", ["@e22", "estado_horas"]),
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["select >> nth=1", "estado_horas"]),
+            call("dentidesk", "eval", [ANY]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
+
+    def test_select_with_option_ref_uses_dom_eval_first_for_dependent_dropdown(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                    },
+                },
+                {"success": True, "data": {"value": None}},
+                {"success": True, "data": {"value": "estado_horas"}},
+                {
+                    "success": True,
+                    "data": {
+                        "result": '{"success": true, "ready": true, "matched_value": "estado_horas", "matched_text": "Reporte por estado de citas"}',
+                    },
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "result": '{"success": true, "selected": "estado_horas", "matched_text": "Reporte por estado de citas"}',
+                    },
+                },
+            ]
+
             result = json.loads(browser_select("@e22", option_ref="@e30", task_id="dentidesk"))
 
         assert mock_cmd.call_args_list == [
             call("dentidesk", "snapshot", ["-c"]),
             call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
             call("dentidesk", "eval", [ANY]),
-            call("dentidesk", "select", ["@e22", "estado_horas"]),
-            call("dentidesk", "snapshot", ["-c"]),
-            call("dentidesk", "select", ["select >> nth=1", "estado_horas"]),
             call("dentidesk", "eval", [ANY]),
         ]
         assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
