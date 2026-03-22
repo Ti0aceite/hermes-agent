@@ -93,7 +93,7 @@ class TestVerboseAndToolProgress:
     def test_tool_progress_mode_is_string(self):
         cli = _make_cli()
         assert isinstance(cli.tool_progress_mode, str)
-        assert cli.tool_progress_mode in ("off", "new", "all", "verbose")
+        assert cli.tool_progress_mode in ("off", "summary", "new", "all", "verbose")
 
 
 class TestSingleQueryState:

@@ -75,6 +75,8 @@ _ensure_ssl_certs()
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from agent.redact import redact_sensitive_text
+
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
@@ -4471,7 +4473,7 @@ class GatewayRunner:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
         
-        # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
+        # Tool progress mode from config.yaml: "summary", "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
         _progress_cfg = {}
         try:
@@ -4509,11 +4511,24 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+
+            if progress_mode == "summary":
+                msg = f"{emoji} {tool_name}..."
+                if msg == last_progress_msg[0]:
+                    repeat_count[0] += 1
+                    progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                    return
+                last_progress_msg[0] = msg
+                repeat_count[0] = 0
+                progress_queue.put(msg)
+                return
             
             # Verbose mode: show detailed arguments
             if progress_mode == "verbose" and args:
                 import json as _json
-                args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                args_str = redact_sensitive_text(
+                    _json.dumps(args, ensure_ascii=False, default=str)
+                )
                 if len(args_str) > 200:
                     args_str = args_str[:197] + "..."
                 msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
@@ -4521,6 +4536,7 @@ class GatewayRunner:
                 return
             
             if preview:
+                preview = redact_sensitive_text(preview)
                 # Truncate preview to keep messages clean
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
