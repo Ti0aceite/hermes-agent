@@ -2216,6 +2216,66 @@ class TestSaveSessionLogAtomicWrite:
         assert call_args.kwargs["indent"] == 2
         assert call_args.kwargs["default"] is str
 
+    def test_redacts_browser_type_arguments_and_system_prompt(self, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("DENTIDESK_PASS", "Mikaela4905#")
+        agent.session_log_file = tmp_path / "session.json"
+        agent._cached_system_prompt = "Tu contraseña es Mikaela4905#"
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "browser_type",
+                            "arguments": json.dumps({"ref": "@e5", "text": "Mikaela4905#"}),
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with patch("run_agent.atomic_json_write", create=True) as mock_atomic_write:
+            agent._save_session_log(messages)
+
+        payload = mock_atomic_write.call_args.args[1]
+        assert "Mikaela4905#" not in payload["system_prompt"]
+        saved_args = json.loads(payload["messages"][0]["tool_calls"][0]["function"]["arguments"])
+        assert saved_args == {"ref": "@e5", "text_redacted": True, "typed_chars": 12}
+
+    def test_request_dump_redacts_browser_type_and_system_content(self, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("DENTIDESK_PASS", "Mikaela4905#")
+        agent.logs_dir = tmp_path
+        agent.api_mode = "chat_completions"
+        agent.base_url = "https://api.openai.com/v1"
+        agent.client = SimpleNamespace(api_key="sk-test-1234567890")
+        api_kwargs = {
+            "messages": [
+                {"role": "system", "content": "Tu contraseña es Mikaela4905#"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "browser_type",
+                                "arguments": json.dumps({"ref": "@e5", "text": "Mikaela4905#"}),
+                            },
+                        }
+                    ],
+                },
+            ]
+        }
+
+        dump_path = agent._dump_api_request_debug(api_kwargs, reason="unit-test")
+        payload = json.loads(dump_path.read_text(encoding="utf-8"))
+
+        assert "Mikaela4905#" not in json.dumps(payload, ensure_ascii=False)
+        saved_args = json.loads(
+            payload["request"]["body"]["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        )
+        assert saved_args == {"ref": "@e5", "text_redacted": True, "typed_chars": 12}
+
 
 # ===================================================================
 # Anthropic adapter integration fixes

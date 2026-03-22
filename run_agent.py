@@ -97,6 +97,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.redact import redact_sensitive_text
 from utils import atomic_json_write
 
 HONCHO_TOOL_NAMES = {
@@ -105,6 +106,68 @@ HONCHO_TOOL_NAMES = {
     "honcho_search",
     "honcho_conclude",
 }
+
+
+def _sanitize_tool_arguments_for_persistence(tool_name: str, arguments: Any) -> Any:
+    """Return a persistence-safe copy of sensitive tool arguments."""
+    if tool_name != "browser_type" or not isinstance(arguments, dict):
+        return arguments
+
+    sanitized: Dict[str, Any] = {}
+    if "ref" in arguments:
+        sanitized["ref"] = arguments["ref"]
+    if arguments.get("secret_env_var"):
+        sanitized["secret_env_var"] = arguments["secret_env_var"]
+    if "text" in arguments:
+        sanitized["text_redacted"] = True
+        sanitized["typed_chars"] = len(str(arguments.get("text") or ""))
+    return sanitized
+
+
+def _sanitize_tool_argument_string_for_persistence(tool_name: str, raw_arguments: Any) -> Any:
+    """Sanitize serialized tool arguments before writing debug/session artifacts."""
+    if not isinstance(raw_arguments, str):
+        return raw_arguments
+    try:
+        parsed = json.loads(raw_arguments)
+    except Exception:
+        return raw_arguments
+    if not isinstance(parsed, dict):
+        return raw_arguments
+    sanitized = _sanitize_tool_arguments_for_persistence(tool_name, parsed)
+    if sanitized is parsed:
+        return raw_arguments
+    return json.dumps(sanitized, ensure_ascii=False)
+
+
+def _sanitize_persisted_payload(value: Any) -> Any:
+    """Recursively sanitize payloads before persisting them to disk."""
+    if isinstance(value, list):
+        return [_sanitize_persisted_payload(item) for item in value]
+
+    if isinstance(value, dict):
+        sanitized = {key: _sanitize_persisted_payload(item) for key, item in value.items()}
+
+        function = sanitized.get("function")
+        if isinstance(function, dict):
+            tool_name = function.get("name")
+            function["arguments"] = _sanitize_tool_argument_string_for_persistence(
+                tool_name,
+                function.get("arguments"),
+            )
+
+        if sanitized.get("type") == "function_call" and isinstance(sanitized.get("name"), str):
+            sanitized["arguments"] = _sanitize_tool_argument_string_for_persistence(
+                sanitized["name"],
+                sanitized.get("arguments"),
+            )
+
+        if sanitized.get("role") == "system" and isinstance(sanitized.get("content"), str):
+            sanitized["content"] = redact_sensitive_text(sanitized["content"])
+
+        return sanitized
+
+    return value
 
 
 class _SafeWriter:
@@ -1764,6 +1827,7 @@ class AIAgent:
             body = copy.deepcopy(api_kwargs)
             body.pop("timeout", None)
             body = {k: v for k, v in body.items() if v is not None}
+            body = _sanitize_persisted_payload(body)
 
             api_key = None
             try:
@@ -1862,6 +1926,7 @@ class AIAgent:
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
                 cleaned.append(msg)
+            cleaned = _sanitize_persisted_payload(cleaned)
 
             entry = {
                 "session_id": self.session_id,
@@ -1870,7 +1935,7 @@ class AIAgent:
                 "platform": self.platform,
                 "session_start": self.session_start.isoformat(),
                 "last_updated": datetime.now().isoformat(),
-                "system_prompt": self._cached_system_prompt or "",
+                "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
                 "messages": cleaned,
@@ -4707,7 +4772,7 @@ class AIAgent:
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
             for i, (tc, name, args) in enumerate(parsed_calls, 1):
-                args_str = json.dumps(args, ensure_ascii=False)
+                args_str = redact_sensitive_text(json.dumps(args, ensure_ascii=False))
                 if self.verbose_logging:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
                     print(f"     Args: {args_str}")
@@ -4719,6 +4784,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
+                    preview = redact_sensitive_text(preview) if preview else preview
                     self.tool_progress_callback(name, preview, args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
@@ -4866,7 +4932,7 @@ class AIAgent:
                 function_args = {}
 
             if not self.quiet_mode:
-                args_str = json.dumps(function_args, ensure_ascii=False)
+                args_str = redact_sensitive_text(json.dumps(function_args, ensure_ascii=False))
                 if self.verbose_logging:
                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())})")
                     print(f"     Args: {args_str}")
@@ -4877,6 +4943,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
+                    preview = redact_sensitive_text(preview) if preview else preview
                     self.tool_progress_callback(function_name, preview, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
