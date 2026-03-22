@@ -441,15 +441,7 @@ BROWSER_TOOL_SCHEMAS = [
                     "description": "Reference to an option element in the snapshot (e.g., '@e9')"
                 }
             },
-            "required": ["ref"],
-            "oneOf": [
-                {
-                    "required": ["value"]
-                },
-                {
-                    "required": ["option_ref"]
-                }
-            ]
+            "required": ["ref"]
         }
     },
     {

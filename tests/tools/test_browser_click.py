@@ -9,6 +9,18 @@ from unittest.mock import ANY, call, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+def test_browser_select_schema_is_openai_compatible():
+    from tools.browser_tool import _BROWSER_SCHEMA_MAP
+
+    params = _BROWSER_SCHEMA_MAP["browser_select"]["parameters"]
+
+    assert params["type"] == "object"
+    assert "oneOf" not in params
+    assert "anyOf" not in params
+    assert "allOf" not in params
+    assert params["required"] == ["ref"]
+
+
 class TestBrowserClickLinkNavigation:
     def test_relative_href_from_snapshot_uses_browser_navigate(self):
         from tools.browser_tool import browser_click
