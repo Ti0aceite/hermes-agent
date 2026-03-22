@@ -68,6 +68,7 @@ from .browser_tool import (
     browser_navigate,
     browser_snapshot,
     browser_click,
+    browser_select,
     browser_type,
     browser_scroll,
     browser_back,
@@ -197,6 +198,7 @@ __all__ = [
     'browser_navigate',
     'browser_snapshot',
     'browser_click',
+    'browser_select',
     'browser_type',
     'browser_scroll',
     'browser_back',
@@ -259,4 +261,3 @@ __all__ = [
     'check_delegate_requirements',
     'DELEGATE_TASK_SCHEMA',
 ]
-
