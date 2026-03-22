@@ -100,6 +100,7 @@ SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
 # the first select fires its change event. Wait briefly before giving up.
 SELECT_OPTION_WAIT_TIMEOUT = 5.0
 SELECT_OPTION_POLL_INTERVAL = 0.25
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _get_vision_model() -> Optional[str]:
@@ -479,7 +480,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Provide exactly one of text or secret_env_var. When secret_env_var is used, Hermes resolves the environment variable at runtime without exposing the secret value in tool progress or persisted traces. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -490,9 +491,13 @@ BROWSER_TOOL_SCHEMAS = [
                 "text": {
                     "type": "string",
                     "description": "The text to type into the field"
+                },
+                "secret_env_var": {
+                    "type": "string",
+                    "description": "Optional environment variable name to resolve and type at runtime for sensitive inputs. Provide this instead of text for passwords, tokens, and other secrets."
                 }
             },
-            "required": ["ref", "text"]
+            "required": ["ref"]
         }
     },
     {
@@ -2343,33 +2348,76 @@ def browser_extract_visible_table(
     }, ensure_ascii=False)
 
 
-def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
+def _resolve_browser_type_input(
+    text: Optional[str],
+    secret_env_var: Optional[str],
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve browser_type input, optionally from an environment variable."""
+    provided_text = text if text is not None else None
+    provided_secret = (secret_env_var or "").strip() or None
+
+    if bool(provided_text is not None) == bool(provided_secret):
+        return None, {
+            "success": False,
+            "error": "Provide exactly one of 'text' or 'secret_env_var'",
+        }
+
+    if provided_secret:
+        if not _ENV_VAR_NAME_RE.match(provided_secret):
+            return None, {
+                "success": False,
+                "error": f"Invalid environment variable name: {provided_secret}",
+            }
+        if provided_secret not in os.environ:
+            return None, {
+                "success": False,
+                "error": f"Environment variable '{provided_secret}' is not set",
+            }
+        return os.environ[provided_secret], None
+
+    return provided_text or "", None
+
+
+def browser_type(
+    ref: str,
+    text: Optional[str] = None,
+    secret_env_var: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
     """
     Type text into an input field.
     
     Args:
         ref: Element reference (e.g., "@e3")
         text: Text to type
+        secret_env_var: Optional environment variable name for sensitive values
         task_id: Task identifier for session isolation
         
     Returns:
         JSON string with type result
     """
     effective_task_id = task_id or "default"
+    resolved_text, validation_error = _resolve_browser_type_input(text, secret_env_var)
+    if validation_error:
+        return json.dumps(validation_error, ensure_ascii=False)
     
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
     
     # Use fill command (clears then types)
-    result = _run_browser_command(effective_task_id, "fill", [ref, text])
+    result = _run_browser_command(effective_task_id, "fill", [ref, resolved_text or ""])
     
     if result.get("success"):
-        return json.dumps({
+        response: Dict[str, Any] = {
             "success": True,
-            "typed": text,
-            "element": ref
-        }, ensure_ascii=False)
+            "typed": True,
+            "typed_chars": len(resolved_text or ""),
+            "element": ref,
+        }
+        if secret_env_var:
+            response["typed_from_env"] = secret_env_var
+        return json.dumps(response, ensure_ascii=False)
     else:
         return json.dumps({
             "success": False,
@@ -3057,7 +3105,12 @@ registry.register(
     name="browser_type",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
-    handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_type(
+        ref=args.get("ref", ""),
+        text=args.get("text"),
+        secret_env_var=args.get("secret_env_var"),
+        task_id=kw.get("task_id"),
+    ),
     check_fn=check_browser_requirements,
     emoji="⌨️",
 )
