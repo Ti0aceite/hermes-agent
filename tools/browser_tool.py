@@ -450,6 +450,20 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_click_row_detail",
+        "description": "Find a table row whose text includes row_text and click the rightmost interactive control in that row, such as a detail icon or lupa. Use this when icon-only controls are not exposed in browser_snapshot. Requires browser_navigate first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "row_text": {
+                    "type": "string",
+                    "description": "Text that identifies the target row (for example 'Confirmo y no asistio' or 'No asiste y no confirma')."
+                }
+            },
+            "required": ["row_text"]
+        }
+    },
+    {
         "name": "browser_type",
         "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
@@ -1622,6 +1636,123 @@ def _wait_for_select_option(
         time.sleep(SELECT_OPTION_POLL_INTERVAL)
 
 
+def _build_row_detail_click_script(row_text: str) -> str:
+    """Build a DOM click script for icon-only detail controls inside table rows."""
+    row_text_json = json.dumps(row_text)
+    return f"""(() => {{
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  const target = normalize({row_text_json});
+  if (!target) {{
+    return JSON.stringify({{
+      success: false,
+      error: "row_text is required."
+    }});
+  }}
+
+  const isVisible = (el) => Boolean(
+    el &&
+    typeof el.getClientRects === "function" &&
+    el.getClientRects().length
+  );
+
+  const uniqueVisible = (elements) => {{
+    const seen = new Set();
+    const result = [];
+    for (const element of elements) {{
+      if (!element || seen.has(element) || !isVisible(element)) {{
+        continue;
+      }}
+      seen.add(element);
+      result.push(element);
+    }}
+    return result;
+  }};
+
+  const clickElement = (element) => {{
+    if (!element) {{
+      return false;
+    }}
+    try {{
+      element.scrollIntoView({{ block: "center", inline: "center" }});
+    }} catch (error) {{
+      // Ignore scroll failures and still attempt the click.
+    }}
+
+    const event = new MouseEvent("click", {{
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }});
+
+    if (typeof element.click === "function") {{
+      element.click();
+      return true;
+    }}
+
+    return element.dispatchEvent(event);
+  }};
+
+  const interactiveSelectors = [
+    "a[href]",
+    "button",
+    "[role='button']",
+    "input[type='button']",
+    "input[type='submit']",
+    "[onclick]"
+  ].join(",");
+  const iconSelectors = ["img", "svg", "i", "span"].join(",");
+  const rows = Array.from(document.querySelectorAll("tr, [role='row']")).filter((row) =>
+    normalize(row.innerText || row.textContent).includes(target)
+  );
+
+  if (!rows.length) {{
+    return JSON.stringify({{
+      success: false,
+      error: `No table row found matching "${{target}}".`
+    }});
+  }}
+
+  for (const row of rows) {{
+    const cells = Array.from(row.querySelectorAll("td, th"));
+    const lastCell = cells[cells.length - 1] || row;
+    const candidates = uniqueVisible([
+      ...Array.from(lastCell.querySelectorAll(interactiveSelectors)),
+      ...Array.from(lastCell.querySelectorAll(iconSelectors)),
+      ...Array.from(row.querySelectorAll(interactiveSelectors)),
+    ]);
+
+    const clicked = candidates[candidates.length - 1] || null;
+    if (!clicked) {{
+      continue;
+    }}
+
+    if (!clickElement(clicked)) {{
+      continue;
+    }}
+
+    return JSON.stringify({{
+      success: true,
+      row_text: {row_text_json},
+      matched_row_text: String(row.innerText || row.textContent || "").replace(/\\s+/g, " ").trim(),
+      clicked_tag: String(clicked.tagName || "").toLowerCase(),
+      clicked_text: String(clicked.innerText || clicked.textContent || "").replace(/\\s+/g, " ").trim() || null,
+      clicked_href: typeof clicked.getAttribute === "function" ? clicked.getAttribute("href") : null,
+    }});
+  }}
+
+  return JSON.stringify({{
+    success: false,
+    error: `No clickable detail control found in row matching "${{target}}".`
+  }});
+}})()"""
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -1954,6 +2085,43 @@ def browser_select(
     return json.dumps({
         "success": False,
         "error": result.get("error", f"Failed to select {selected_value} in {ref}")
+    }, ensure_ascii=False)
+
+
+def browser_click_row_detail(row_text: str, task_id: Optional[str] = None) -> str:
+    """
+    Click the rightmost interactive control in a table row matching row_text.
+
+    Args:
+        row_text: Text that identifies the row
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with click result
+    """
+    effective_task_id = task_id or "default"
+    target_row = str(row_text or "").strip()
+    if not target_row:
+        return json.dumps({
+            "success": False,
+            "error": "row_text is required."
+        }, ensure_ascii=False)
+
+    script = _build_row_detail_click_script(target_row)
+    result = _run_browser_command(effective_task_id, "eval", [script])
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", f"Failed to click detail for row {target_row}")
+        }, ensure_ascii=False)
+
+    parsed = _parse_eval_result_dict(result.get("data", {}).get("result"))
+    if parsed and parsed.get("success"):
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": (parsed or {}).get("error", f"Failed to click detail for row {target_row}")
     }, ensure_ascii=False)
 
 
@@ -2644,6 +2812,17 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🗂️",
+)
+registry.register(
+    name="browser_click_row_detail",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_click_row_detail"],
+    handler=lambda args, **kw: browser_click_row_detail(
+        row_text=args.get("row_text", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🔎",
 )
 registry.register(
     name="browser_type",

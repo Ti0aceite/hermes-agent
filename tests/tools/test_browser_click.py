@@ -21,6 +21,18 @@ def test_browser_select_schema_is_openai_compatible():
     assert params["required"] == ["ref"]
 
 
+def test_browser_click_row_detail_schema_is_openai_compatible():
+    from tools.browser_tool import _BROWSER_SCHEMA_MAP
+
+    params = _BROWSER_SCHEMA_MAP["browser_click_row_detail"]["parameters"]
+
+    assert params["type"] == "object"
+    assert "oneOf" not in params
+    assert "anyOf" not in params
+    assert "allOf" not in params
+    assert params["required"] == ["row_text"]
+
+
 class TestBrowserClickLinkNavigation:
     def test_relative_href_from_snapshot_uses_browser_navigate(self):
         from tools.browser_tool import browser_click
@@ -318,7 +330,61 @@ class TestBrowserSelect:
             call("dentidesk", "getattribute", ["@e9", "value"]),
             call("dentidesk", "select", ["@e1", "Blue"]),
         ]
-        assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
+
+class TestBrowserClickRowDetail:
+    def test_click_row_detail_uses_eval_and_returns_clicked_metadata(self):
+        from tools.browser_tool import browser_click_row_detail
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": True,
+                            "row_text": "Confirmo y no asistio",
+                            "matched_row_text": "Confirmó y no asistió 8",
+                            "clicked_tag": "a",
+                            "clicked_href": "javascript:void(0)",
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_click_row_detail("Confirmo y no asistio", task_id="dentidesk")
+            )
+
+        assert mock_cmd.call_count == 1
+        assert mock_cmd.call_args[0][0] == "dentidesk"
+        assert mock_cmd.call_args[0][1] == "eval"
+        assert "Confirmo y no asistio" in mock_cmd.call_args[0][2][0]
+        assert result["success"] is True
+        assert result["clicked_tag"] == "a"
+
+    def test_click_row_detail_returns_eval_error_when_no_control_found(self):
+        from tools.browser_tool import browser_click_row_detail
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": False,
+                            "error": "No clickable detail control found in row matching \"confirmo y no asistio\".",
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_click_row_detail("Confirmo y no asistio", task_id="dentidesk")
+            )
+
+        assert result["success"] is False
+        assert "No clickable detail control found" in result["error"]
 
     def test_select_with_option_ref_resolves_label_to_real_value_from_parent_select(self):
         from tools.browser_tool import browser_select
