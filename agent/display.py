@@ -11,6 +11,8 @@ import sys
 import threading
 import time
 
+from agent.redact import redact_sensitive_text
+
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"
 _RESET = "\033[0m"
@@ -98,6 +100,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str | N
     """Build a short preview of a tool call's primary argument for display."""
     if not args:
         return None
+    if tool_name == "browser_type" and args.get("secret_env_var"):
+        return f"${args['secret_env_var']}"
     primary_args = {
         "terminal": "command", "web_search": "query", "web_extract": "urls",
         "read_file": "path", "write_file": "path", "patch": "path",
@@ -190,6 +194,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str | N
     preview = _oneline(str(value))
     if not preview:
         return None
+    preview = redact_sensitive_text(preview)
     if len(preview) > max_len:
         preview = preview[:max_len - 3] + "..."
     return preview
@@ -505,7 +510,11 @@ def get_cute_tool_message(
     if tool_name == "browser_click":
         return _wrap(f"┊ 👆 click     {args.get('ref', '?')}  {dur}")
     if tool_name == "browser_type":
-        return _wrap(f"┊ ⌨️  type      \"{_trunc(args.get('text', ''), 30)}\"  {dur}")
+        if args.get("secret_env_var"):
+            value = f"${args.get('secret_env_var')}"
+        else:
+            value = redact_sensitive_text(args.get("text", ""))
+        return _wrap(f"┊ ⌨️  type      \"{_trunc(value, 30)}\"  {dur}")
     if tool_name == "browser_scroll":
         d = args.get("direction", "down")
         arrow = {"down": "↓", "up": "↑", "right": "→", "left": "←"}.get(d, "↓")

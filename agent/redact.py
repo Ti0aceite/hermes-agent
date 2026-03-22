@@ -81,6 +81,13 @@ _DB_CONNSTR_RE = re.compile(
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
+# Secret-like env var names whose resolved values should be masked when they
+# appear elsewhere in logs or tool previews.
+_ENV_ASSIGN_RE_NAME = re.compile(
+    r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIAL|AUTH)",
+    re.IGNORECASE,
+)
+
 # Compile known prefix patterns into one alternation
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
@@ -146,6 +153,12 @@ def redact_sensitive_text(text: str) -> str:
             return phone[:2] + "****" + phone[-2:]
         return phone[:4] + "****" + phone[-4:]
     text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+
+    # Replace any exact env values whose variable names look secret-like.
+    for env_key, env_val in os.environ.items():
+        if _ENV_ASSIGN_RE_NAME.search(env_key) and env_val and len(env_val) >= 4:
+            if env_val in text:
+                text = text.replace(env_val, "***")
 
     return text
 

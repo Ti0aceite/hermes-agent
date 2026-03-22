@@ -1020,7 +1020,8 @@ class HermesCLI:
         self.console = Console()
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
-        # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
+        # tool_progress: "off", "summary", "new", "all", "verbose"
+        # (from config.yaml display section)
         self.tool_progress_mode = CLI_CONFIG["display"].get("tool_progress", "all")
         # resume_display: "full" (show history) | "minimal" (one-liner only)
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
@@ -4199,8 +4200,8 @@ class HermesCLI:
             print("  Prompt + TUI colors updated.")
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off."""
-        cycle = ["off", "new", "all", "verbose"]
+        """Cycle tool progress mode: off → summary → new → all → verbose → off."""
+        cycle = ["off", "summary", "new", "all", "verbose"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -4219,6 +4220,7 @@ class HermesCLI:
 
         labels = {
             "off": "[dim]Tool progress: OFF[/] — silent mode, just the final response.",
+            "summary": "[cyan]Tool progress: SUMMARY[/] — generic tool status without args or previews.",
             "new": "[yellow]Tool progress: NEW[/] — show each new tool (skip repeats).",
             "all": "[green]Tool progress: ALL[/] — show every tool call.",
             "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, think blocks, and debug logs.",

@@ -667,6 +667,7 @@ display:
 
   # Tool progress display level (CLI and gateway)
   #   off:     Silent — no tool activity shown, just the final response
+  #   summary: Show generic tool status only (no args or previews)
   #   new:     Show a tool indicator only when the tool changes (skip repeats)
   #   all:     Show every tool call with a short preview (default)
   #   verbose: Full args, results, and debug logs (same as /verbose)

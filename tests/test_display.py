@@ -26,6 +26,17 @@ class TestBuildToolPreview:
         assert result is not None
         assert "hello world" in result
 
+    def test_browser_type_secret_env_preview(self):
+        result = build_tool_preview("browser_type", {"secret_env_var": "DENTIDESK_PASS"})
+        assert result == "$DENTIDESK_PASS"
+
+    def test_browser_type_text_preview_redacts_env_secret(self, monkeypatch):
+        monkeypatch.setenv("DENTIDESK_PASS", "Mikaela4905#")
+        result = build_tool_preview("browser_type", {"text": "Mikaela4905#"})
+        assert result is not None
+        assert "Mikaela4905#" not in result
+        assert "***" in result
+
     def test_read_file_preview(self):
         result = build_tool_preview("read_file", {"path": "/tmp/test.py", "offset": 1})
         assert result is not None
