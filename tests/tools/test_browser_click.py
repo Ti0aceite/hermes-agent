@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from unittest.mock import call, patch
+from unittest.mock import ANY, call, patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -298,6 +298,122 @@ class TestBrowserSelect:
             call("dentidesk", "select", ["@e1", "Blue"]),
         ]
         assert result == {"success": True, "selected": "Blue", "element": "@e1"}
+
+    def test_select_retries_with_nth_selector_for_ambiguous_combobox(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                        "refs": {
+                            "e17": {"name": "Tipo de reporte:", "role": "combobox"},
+                            "e22": {"role": "combobox"},
+                            "e30": {"name": "Reporte por estado de citas", "role": "option"},
+                        },
+                    },
+                },
+                {"success": True, "data": {"value": "estado_horas"}},
+                {
+                    "success": False,
+                    "error": 'Selector "@e22" matched 2 elements. Run \'snapshot\' to get updated refs, or use a more specific CSS selector.',
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                        "refs": {
+                            "e17": {"name": "Tipo de reporte:", "role": "combobox"},
+                            "e22": {"role": "combobox"},
+                        },
+                    },
+                },
+                {"success": True},
+            ]
+
+            result = json.loads(browser_select("@e22", option_ref="@e30", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "select", ["@e22", "estado_horas"]),
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["select >> nth=1", "estado_horas"]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
+
+    def test_select_falls_back_to_dom_eval_after_timeout(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                        "refs": {
+                            "e17": {"name": "Tipo de reporte:", "role": "combobox"},
+                            "e22": {"role": "combobox"},
+                            "e30": {"name": "Reporte por estado de citas", "role": "option"},
+                        },
+                    },
+                },
+                {"success": True, "data": {"value": "estado_horas"}},
+                {
+                    "success": False,
+                    "error": 'Selector "@e22" matched 2 elements. Run \'snapshot\' to get updated refs, or use a more specific CSS selector.',
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                        "refs": {
+                            "e17": {"name": "Tipo de reporte:", "role": "combobox"},
+                            "e22": {"role": "combobox"},
+                        },
+                    },
+                },
+                {
+                    "success": False,
+                    "error": "Command timed out after 30 seconds",
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "result": '{"success": true, "selected": "estado_horas", "matched_text": "Reporte por estado de citas"}',
+                    },
+                },
+            ]
+
+            result = json.loads(browser_select("@e22", option_ref="@e30", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "select", ["@e22", "estado_horas"]),
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "select", ["select >> nth=1", "estado_horas"]),
+            call("dentidesk", "eval", [ANY]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
 
 
 class TestBrowserNavigateAutoSnapshot:

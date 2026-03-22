@@ -1069,6 +1069,31 @@ def _extract_snapshot_line_text(line: str) -> Optional[str]:
     return before_ref or None
 
 
+def _snapshot_ref_index(snapshot_text: str, ref: str, token: str) -> Optional[int]:
+    """Return the zero-based index of a ref among lines containing a token."""
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref if ref.startswith("@") else f"@{ref}"
+    target = normalized_ref[1:]
+    index = 0
+
+    for line in snapshot_text.splitlines():
+        if token not in line or "[ref=" not in line:
+            continue
+
+        match = re.search(r"\[ref=(e\d+)\]", line)
+        if not match:
+            continue
+
+        current_ref = "@" + match.group(1)
+        if current_ref == normalized_ref or match.group(1) == target:
+            return index
+        index += 1
+
+    return None
+
+
 def _resolve_snapshot_ref_text(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Resolve a ref to its human-readable text using the current snapshot."""
     effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
@@ -1113,6 +1138,24 @@ def _resolve_select_option_value(
         normalized_option_ref,
         snapshot_result=snapshot_result,
     )
+
+
+def _resolve_combobox_selector(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a combobox ref to a stable Playwright locator string."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return None
+
+    entry = _snapshot_refs(effective_snapshot).get(ref[1:] if ref.startswith("@") else ref)
+    if not isinstance(entry, dict) or entry.get("role") != "combobox":
+        return None
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    combobox_index = _snapshot_ref_index(snapshot_text, ref, "combobox")
+    if combobox_index is None:
+        return None
+
+    return f"select >> nth={combobox_index}"
 
 
 def _get_snapshot_href(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -1185,6 +1228,31 @@ def _is_invalid_ref_or_selector_error(error: Optional[str]) -> bool:
     return any(marker in lowered for marker in invalid_markers)
 
 
+def _is_ambiguous_locator_error(error: Optional[str]) -> bool:
+    """Return True when a locator resolves to multiple elements."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    ambiguous_markers = (
+        "matched 2 elements",
+        "matched 3 elements",
+        "matched 4 elements",
+        "strict mode violation",
+        "resolved to",
+    )
+    return any(marker in lowered for marker in ambiguous_markers)
+
+
+def _is_command_timeout_error(error: Optional[str]) -> bool:
+    """Return True when the browser command timed out."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    return "timed out" in lowered or "timeout" in lowered
+
+
 def _is_navigable_href(href: Optional[str]) -> bool:
     """Return True when an href should be treated as full-page navigation."""
     if not href:
@@ -1229,6 +1297,115 @@ def _resolve_click_navigation_url(
         return None
 
     return urljoin(current_url, href)
+
+
+def _resolve_select_dom_index(ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Resolve a combobox ref/selector to a DOM select index for JS fallback."""
+    if ref.startswith("@"):
+        effective_snapshot = snapshot_result or {}
+        snapshot_text = _snapshot_text(effective_snapshot)
+        if not snapshot_text:
+            return None
+        return _snapshot_ref_index(snapshot_text, ref, "combobox")
+
+    nth_match = re.search(r"nth\s*=\s*(\d+)", ref)
+    if nth_match:
+        return int(nth_match.group(1))
+
+    return None
+
+
+def _build_select_eval_script(ref: str, selected_value: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Build a DOM-level select fallback script for stubborn dropdowns."""
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if dom_index is None:
+        return None
+
+    target_value = json.dumps(selected_value)
+
+    return f"""(() => {{
+  const selects = Array.from(document.querySelectorAll("select"));
+  const selectEl = selects[{dom_index}] || null;
+  if (!selectEl) {{
+    return JSON.stringify({{ success: false, error: "Select element not found for DOM fallback." }});
+  }}
+
+  const targetValue = {target_value};
+  const options = Array.from(selectEl.options || []);
+  const matchedOption =
+    options.find(option => String(option.value) === targetValue) ||
+    options.find(option => (option.textContent || "").trim() === targetValue);
+
+  if (!matchedOption) {{
+    return JSON.stringify({{
+      success: false,
+      error: `Option ${{targetValue}} not found in DOM fallback.`
+    }});
+  }}
+
+  selectEl.value = matchedOption.value;
+  matchedOption.selected = true;
+  selectEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  selectEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+  if (window.jQuery) {{
+    try {{
+      window.jQuery(selectEl).trigger("input");
+      window.jQuery(selectEl).trigger("change");
+    }} catch (_) {{
+      // Ignore jQuery trigger issues and rely on native events.
+    }}
+  }}
+
+  return JSON.stringify({{
+    success: true,
+    selected: matchedOption.value || targetValue,
+    matched_text: (matchedOption.textContent || "").trim()
+  }});
+}})()"""
+
+
+def _select_via_eval(
+    task_id: str,
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fallback selection by setting the DOM value and dispatching events."""
+    script = _build_select_eval_script(ref, selected_value, snapshot_result=snapshot_result)
+    if not script:
+        return {
+            "success": False,
+            "error": "Could not resolve a stable DOM select index for fallback.",
+        }
+
+    result = _run_browser_command(task_id, "eval", [script])
+    if not result.get("success"):
+        return result
+
+    raw_result = result.get("data", {}).get("result")
+    parsed_result: Optional[Dict[str, Any]] = None
+    if isinstance(raw_result, str):
+        try:
+            maybe_parsed = json.loads(raw_result)
+            if isinstance(maybe_parsed, dict):
+                parsed_result = maybe_parsed
+        except json.JSONDecodeError:
+            parsed_result = None
+    elif isinstance(raw_result, dict):
+        parsed_result = raw_result
+
+    if parsed_result and parsed_result.get("success"):
+        return {"success": True, "data": parsed_result}
+
+    return {
+        "success": False,
+        "error": (
+            (parsed_result or {}).get("error")
+            or result.get("error")
+            or "DOM select fallback failed."
+        ),
+    }
 
 
 # ============================================================================
@@ -1486,9 +1663,29 @@ def browser_select(
         }, ensure_ascii=False)
 
     result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
-    if not result.get("success") and _is_invalid_ref_or_selector_error(result.get("error")):
-        _get_compact_snapshot(effective_task_id)
-        result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
+    fallback_snapshot = snapshot_result
+    if not result.get("success") and (
+        _is_invalid_ref_or_selector_error(result.get("error"))
+        or _is_ambiguous_locator_error(result.get("error"))
+    ):
+        retry_snapshot = _get_compact_snapshot(effective_task_id)
+        fallback_snapshot = retry_snapshot if retry_snapshot.get("success") else snapshot_result
+        retry_ref = ref
+        if _is_ambiguous_locator_error(result.get("error")):
+            retry_ref = _resolve_combobox_selector(
+                effective_task_id,
+                ref,
+                snapshot_result=retry_snapshot,
+            ) or ref
+        result = _run_browser_command(effective_task_id, "select", [retry_ref, selected_value])
+
+    if not result.get("success") and _is_command_timeout_error(result.get("error")):
+        result = _select_via_eval(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=fallback_snapshot,
+        )
 
     if result.get("success"):
         return json.dumps({
