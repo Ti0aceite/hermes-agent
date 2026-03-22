@@ -1824,6 +1824,7 @@ def browser_select(
         }, ensure_ascii=False)
 
     snapshot_text = _snapshot_text(snapshot_result)
+    wait_result: Optional[Dict[str, Any]] = None
     if snapshot_text.count("combobox") > 1:
         wait_result = _wait_for_select_option(
             effective_task_id,
@@ -1834,6 +1835,14 @@ def browser_select(
         matched_value = str(wait_result.get("matched_value") or "").strip()
         if matched_value:
             selected_value = matched_value
+        elif wait_result.get("disabled") or int(wait_result.get("option_count") or 0) == 0:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Option {selected_value} is not available yet; "
+                    "the dropdown is still disabled or its options have not loaded."
+                ),
+            }, ensure_ascii=False)
 
     result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
     fallback_snapshot = snapshot_result

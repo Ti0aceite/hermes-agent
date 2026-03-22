@@ -550,6 +550,46 @@ class TestBrowserSelect:
         ]
         assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
 
+    def test_select_fails_fast_when_dependent_dropdown_has_no_options_yet(self):
+        from tools.browser_tool import browser_select
+
+        with (
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool.time.sleep", return_value=None),
+            patch("tools.browser_tool.time.time", side_effect=[0.0, 10.0]),
+        ):
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]'
+                        ),
+                    },
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "result": '{"success": true, "ready": false, "disabled": true, "option_count": 0, "matched_value": null}',
+                    },
+                },
+            ]
+
+            result = json.loads(browser_select("@e22", value="estado_horas", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "eval", [ANY]),
+        ]
+        assert result == {
+            "success": False,
+            "error": (
+                "Option estado_horas is not available yet; "
+                "the dropdown is still disabled or its options have not loaded."
+            ),
+        }
+
 
 class TestBrowserNavigateAutoSnapshot:
     def test_navigation_includes_compact_snapshot(self):
