@@ -1379,17 +1379,45 @@ def _build_select_eval_script(ref: str, selected_value: str, snapshot_result: Op
 
     return f"""(() => {{
   const selects = Array.from(document.querySelectorAll("select"));
-  const selectEl = selects[{dom_index}] || null;
+  const preferredIndex = {dom_index};
+  const targetValue = {target_value};
+
+  const resolveMatch = (selectEl, index) => {{
+    if (!selectEl) {{
+      return null;
+    }}
+
+    const options = Array.from(selectEl.options || []);
+    const matchedOption =
+      options.find(option => String(option.value) === targetValue) ||
+      options.find(option => (option.textContent || "").trim() === targetValue);
+
+    return {{ selectEl, options, matchedOption, index }};
+  }};
+
+  let resolved = resolveMatch(selects[preferredIndex] || null, preferredIndex);
+  if (!resolved || !resolved.matchedOption) {{
+    for (let index = 0; index < selects.length; index += 1) {{
+      if (index === preferredIndex) {{
+        continue;
+      }}
+      const candidate = resolveMatch(selects[index], index);
+      if (candidate && candidate.matchedOption) {{
+        resolved = candidate;
+        break;
+      }}
+      if (!resolved && candidate) {{
+        resolved = candidate;
+      }}
+    }}
+  }}
+
+  const selectEl = resolved?.selectEl || null;
   if (!selectEl) {{
     return JSON.stringify({{ success: false, error: "Select element not found for DOM fallback." }});
   }}
 
-  const targetValue = {target_value};
-  const options = Array.from(selectEl.options || []);
-  const matchedOption =
-    options.find(option => String(option.value) === targetValue) ||
-    options.find(option => (option.textContent || "").trim() === targetValue);
-
+  const matchedOption = resolved?.matchedOption || null;
   if (!matchedOption) {{
     return JSON.stringify({{
       success: false,
@@ -1414,7 +1442,8 @@ def _build_select_eval_script(ref: str, selected_value: str, snapshot_result: Op
   return JSON.stringify({{
     success: true,
     selected: matchedOption.value || targetValue,
-    matched_text: (matchedOption.textContent || "").trim()
+    matched_text: (matchedOption.textContent || "").trim(),
+    resolved_index: resolved?.index ?? preferredIndex
   }});
 }})()"""
 
@@ -1492,7 +1521,40 @@ def _build_select_option_probe_script(
 
     return f"""(() => {{
   const selects = Array.from(document.querySelectorAll("select"));
-  const selectEl = selects[{dom_index}] || null;
+  const preferredIndex = {dom_index};
+  const targetValue = {target_value};
+
+  const resolveMatch = (selectEl, index) => {{
+    if (!selectEl) {{
+      return null;
+    }}
+
+    const options = Array.from(selectEl.options || []);
+    const matchedOption =
+      options.find(option => String(option.value) === targetValue) ||
+      options.find(option => (option.textContent || "").trim() === targetValue);
+
+    return {{ selectEl, options, matchedOption, index }};
+  }};
+
+  let resolved = resolveMatch(selects[preferredIndex] || null, preferredIndex);
+  if (!resolved || !resolved.matchedOption) {{
+    for (let index = 0; index < selects.length; index += 1) {{
+      if (index === preferredIndex) {{
+        continue;
+      }}
+      const candidate = resolveMatch(selects[index], index);
+      if (candidate && candidate.matchedOption) {{
+        resolved = candidate;
+        break;
+      }}
+      if (!resolved && candidate) {{
+        resolved = candidate;
+      }}
+    }}
+  }}
+
+  const selectEl = resolved?.selectEl || null;
   if (!selectEl) {{
     return JSON.stringify({{
       success: false,
@@ -1501,11 +1563,8 @@ def _build_select_option_probe_script(
     }});
   }}
 
-  const targetValue = {target_value};
-  const options = Array.from(selectEl.options || []);
-  const matchedOption =
-    options.find(option => String(option.value) === targetValue) ||
-    options.find(option => (option.textContent || "").trim() === targetValue);
+  const matchedOption = resolved?.matchedOption || null;
+  const options = resolved?.options || Array.from(selectEl.options || []);
 
   return JSON.stringify({{
     success: true,
@@ -1513,7 +1572,8 @@ def _build_select_option_probe_script(
     disabled: Boolean(selectEl.disabled),
     matched_value: matchedOption ? String(matchedOption.value || "") : null,
     matched_text: matchedOption ? (matchedOption.textContent || "").trim() : null,
-    option_count: options.length
+    option_count: options.length,
+    resolved_index: resolved?.index ?? preferredIndex
   }});
 }})()"""
 

@@ -539,6 +539,54 @@ class TestBrowserSelect:
         ]
         assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
 
+    def test_select_with_option_ref_uses_dom_match_outside_snapshot_index(self):
+        from tools.browser_tool import browser_select
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.side_effect = [
+                {
+                    "success": True,
+                    "data": {
+                        "snapshot": (
+                            '  - combobox "Tipo de reporte" [ref=e17]\n'
+                            '  - combobox [ref=e22]\n'
+                            '    - option "Reporte por estado de citas" [ref=e30]'
+                        ),
+                    },
+                },
+                {"success": True, "data": {"value": None}},
+                {"success": True, "data": {"value": None}},
+                {
+                    "success": True,
+                    "data": {
+                        "result": (
+                            '{"success": true, "ready": true, "matched_value": "estado_horas", '
+                            '"matched_text": "Reporte por estado de citas", "resolved_index": 3}'
+                        ),
+                    },
+                },
+                {
+                    "success": True,
+                    "data": {
+                        "result": (
+                            '{"success": true, "selected": "estado_horas", '
+                            '"matched_text": "Reporte por estado de citas", "resolved_index": 3}'
+                        ),
+                    },
+                },
+            ]
+
+            result = json.loads(browser_select("@e22", option_ref="@e30", task_id="dentidesk"))
+
+        assert mock_cmd.call_args_list == [
+            call("dentidesk", "snapshot", ["-c"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "getattribute", ["@e30", "value"]),
+            call("dentidesk", "eval", [ANY]),
+            call("dentidesk", "eval", [ANY]),
+        ]
+        assert result == {"success": True, "selected": "estado_horas", "element": "@e22"}
+
     def test_select_waits_for_dependent_dropdown_option_before_selecting(self):
         from tools.browser_tool import browser_select
 
