@@ -1382,6 +1382,10 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        base_url=self.base_url,
+                        api_key=self.api_key,
+                        api_mode=self.api_mode,
+                        max_tokens=self.max_tokens or 1024,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
