@@ -2276,6 +2276,29 @@ class TestSaveSessionLogAtomicWrite:
         )
         assert saved_args == {"ref": "@e5", "text_redacted": True, "typed_chars": 12}
 
+    def test_redacts_snapshot_username_for_scoped_login_env(self, agent, monkeypatch, tmp_path):
+        monkeypatch.setenv("DENTIDESK_USER", "romina.mora")
+        agent.session_log_file = tmp_path / "session.json"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "snapshot": '- link "romina.mora" [ref=e3]\n- link "Reportes" [ref=e7]',
+                    }
+                ),
+            }
+        ]
+
+        with patch("run_agent.atomic_json_write", create=True) as mock_atomic_write:
+            agent._save_session_log(messages)
+
+        payload = mock_atomic_write.call_args.args[1]
+        saved_content = json.loads(payload["messages"][0]["content"])
+        assert saved_content["snapshot"] == '- link "***" [ref=e3]\n- link "Reportes" [ref=e7]'
+
 
 # ===================================================================
 # Anthropic adapter integration fixes
