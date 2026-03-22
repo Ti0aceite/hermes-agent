@@ -64,6 +64,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from agent.auxiliary_client import call_llm
 
 try:
@@ -94,6 +95,11 @@ DEFAULT_SESSION_TIMEOUT = 300
 
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+
+# Dependent dropdowns in apps like Dentidesk sometimes populate a moment after
+# the first select fires its change event. Wait briefly before giving up.
+SELECT_OPTION_WAIT_TIMEOUT = 5.0
+SELECT_OPTION_POLL_INTERVAL = 0.25
 
 
 def _get_vision_model() -> Optional[str]:
@@ -409,7 +415,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). Hermes hydrates the current snapshot before clicking and retries once if the click fails because the ref/selector is stale or invalid. For links with a navigable href, Hermes automatically treats the click as navigation and may return the new page's URL, title, and snapshot. The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -419,6 +425,56 @@ BROWSER_TOOL_SCHEMAS = [
                 }
             },
             "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_select",
+        "description": "Select an option in a dropdown identified by its ref ID. Provide either value (the option label/value) or option_ref (a ref to an option from the snapshot). Hermes hydrates the current snapshot before selecting and resolves option_ref from the snapshot when needed. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The select element reference from the snapshot (e.g., '@e5')"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The option value to select"
+                },
+                "option_ref": {
+                    "type": "string",
+                    "description": "Reference to an option element in the snapshot (e.g., '@e9')"
+                }
+            },
+            "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_click_row_detail",
+        "description": "Find a table row whose text includes row_text and click the rightmost interactive control in that row, such as a detail icon or lupa. Use this when icon-only controls are not exposed in browser_snapshot. Requires browser_navigate first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "row_text": {
+                    "type": "string",
+                    "description": "Text that identifies the target row (for example 'Confirmo y no asistio' or 'No asiste y no confirma')."
+                }
+            },
+            "required": ["row_text"]
+        }
+    },
+    {
+        "name": "browser_extract_visible_table",
+        "description": "Extract the currently visible table into structured headers and rows. Prefer heading_text when the page has multiple tables; Hermes will target the first visible table that follows that heading. Use this when browser_snapshot truncates long table content and you need every row.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "heading_text": {
+                    "type": "string",
+                    "description": "Optional heading text that identifies the table section to extract, for example 'Detalle estado Confirmo y no asistió'."
+                }
+            },
+            "required": []
         }
     },
     {
@@ -945,6 +1001,943 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
     return snapshot_text[:max_chars] + "\n\n[... content truncated ...]"
 
 
+def _normalize_browser_ref(ref: str) -> str:
+    """Normalize snapshot refs so browser commands always receive @eN."""
+    return ref if ref.startswith("@") else f"@{ref}"
+
+
+def _get_browser_attribute(task_id: str, ref: str, attribute: str) -> Optional[str]:
+    """Read an element attribute via agent-browser and return a stripped value."""
+    result = _run_browser_command(task_id, "getattribute", [ref, attribute])
+    if not result.get("success"):
+        return None
+
+    data = result.get("data", {})
+    value = data.get("value")
+    if value is None:
+        return None
+
+    value_str = str(value).strip()
+    return value_str or None
+
+
+def _get_compact_snapshot(task_id: str) -> Dict[str, Any]:
+    """Fetch the current compact accessibility snapshot for a task."""
+    return _run_browser_command(task_id, "snapshot", ["-c"])
+
+
+def _snapshot_data(snapshot_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the snapshot payload if the command succeeded."""
+    if not snapshot_result.get("success"):
+        return {}
+
+    data = snapshot_result.get("data", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _snapshot_text(snapshot_result: Dict[str, Any]) -> str:
+    """Return the raw snapshot text from a snapshot command result."""
+    return str(_snapshot_data(snapshot_result).get("snapshot") or "")
+
+
+def _snapshot_refs(snapshot_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the refs map from a snapshot command result."""
+    refs = _snapshot_data(snapshot_result).get("refs", {})
+    return refs if isinstance(refs, dict) else {}
+
+
+def _extract_snapshot_ref_text(entry: Any) -> Optional[str]:
+    """Extract a usable label/value from a snapshot ref entry."""
+    if isinstance(entry, str):
+        value = entry.strip()
+        return value or None
+
+    if isinstance(entry, dict):
+        for key in ("value", "label", "text", "name", "title", "aria_label", "ariaLabel"):
+            value = entry.get(key)
+            if value is not None:
+                value_str = str(value).strip()
+                if value_str:
+                    return value_str
+
+    return None
+
+
+def _find_snapshot_ref_line(snapshot_text: str, ref: str) -> Optional[str]:
+    """Return the line in a snapshot that contains the requested ref."""
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref[1:] if ref.startswith("@") else ref
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_ref)}\](?::)?(?:\s.*)?$"
+    )
+    for line in snapshot_text.splitlines():
+        if ref_pattern.match(line):
+            return line
+    return None
+
+
+def _extract_snapshot_line_text(line: str) -> Optional[str]:
+    """Extract the most likely human-readable label from a snapshot line."""
+    if not line:
+        return None
+
+    quoted_values = re.findall(r'"([^"]+)"', line)
+    if quoted_values:
+        value = quoted_values[-1].strip()
+        return value or None
+
+    before_ref = line.split("[ref=", 1)[0]
+    before_ref = re.sub(r"^\s*-\s*", "", before_ref).strip()
+    before_ref = before_ref.rstrip(":").strip()
+    return before_ref or None
+
+
+def _snapshot_ref_index(snapshot_text: str, ref: str, token: str) -> Optional[int]:
+    """Return the zero-based index of a ref among lines containing a token."""
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref if ref.startswith("@") else f"@{ref}"
+    target = normalized_ref[1:]
+    index = 0
+
+    for line in snapshot_text.splitlines():
+        if token not in line or "[ref=" not in line:
+            continue
+
+        match = re.search(r"\[ref=(e\d+)\]", line)
+        if not match:
+            continue
+
+        current_ref = "@" + match.group(1)
+        if current_ref == normalized_ref or match.group(1) == target:
+            return index
+        index += 1
+
+    return None
+
+
+def _resolve_snapshot_ref_text(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a ref to its human-readable text using the current snapshot."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return None
+
+    refs = _snapshot_refs(effective_snapshot)
+    normalized_ref = ref if ref.startswith("@") else f"@{ref}"
+    short_ref = normalized_ref[1:]
+
+    entry = None
+    for key in (normalized_ref, short_ref, ref):
+        if key in refs:
+            entry = refs[key]
+            break
+
+    text = _extract_snapshot_ref_text(entry)
+    if text:
+        return text
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    line = _find_snapshot_ref_line(snapshot_text, normalized_ref)
+    if not line:
+        return None
+
+    return _extract_snapshot_line_text(line)
+
+
+def _resolve_select_option_value(
+    task_id: str,
+    option_ref: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve an option ref to its form value, falling back to visible text."""
+    normalized_option_ref = _normalize_browser_ref(option_ref)
+    option_value = _get_browser_attribute(task_id, normalized_option_ref, "value")
+    if option_value is not None:
+        return option_value
+
+    return _resolve_snapshot_ref_text(
+        task_id,
+        normalized_option_ref,
+        snapshot_result=snapshot_result,
+    )
+
+
+def _resolve_select_value_from_label(
+    task_id: str,
+    select_ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Translate visible option text into its real value when possible."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return selected_value
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    if not snapshot_text:
+        return selected_value
+
+    normalized_select_ref = select_ref[1:] if select_ref.startswith("@") else select_ref
+    lines = snapshot_text.splitlines()
+    target_label = selected_value.strip()
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_select_ref)}\](?::)?(?:\s.*)?$"
+    )
+    option_ref_pattern = re.compile(r"\[ref=(e\d+)\]")
+
+    for idx, line in enumerate(lines):
+        match = ref_pattern.match(line)
+        if not match:
+            continue
+
+        base_indent = len(match.group("indent"))
+        for child_line in lines[idx + 1:]:
+            if not child_line.strip():
+                continue
+
+            child_indent = len(child_line) - len(child_line.lstrip(" "))
+            if child_indent <= base_indent:
+                break
+
+            if "option" not in child_line:
+                continue
+
+            option_ref_match = option_ref_pattern.search(child_line)
+            if not option_ref_match:
+                continue
+
+            option_label = _extract_snapshot_line_text(child_line)
+            if option_label != target_label:
+                continue
+
+            option_ref = "@" + option_ref_match.group(1)
+            resolved_value = _get_browser_attribute(task_id, option_ref, "value")
+            return resolved_value or selected_value
+
+        break
+
+    return selected_value
+
+
+def _resolve_combobox_selector(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a combobox ref to a stable Playwright locator string."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    if not effective_snapshot.get("success"):
+        return None
+
+    entry = _snapshot_refs(effective_snapshot).get(ref[1:] if ref.startswith("@") else ref)
+    if not isinstance(entry, dict) or entry.get("role") != "combobox":
+        return None
+
+    snapshot_text = _snapshot_text(effective_snapshot)
+    combobox_index = _snapshot_ref_index(snapshot_text, ref, "combobox")
+    if combobox_index is None:
+        return None
+
+    return f"select >> nth={combobox_index}"
+
+
+def _get_snapshot_href(task_id: str, ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a link href from the current compact snapshot tree."""
+    result = snapshot_result or _get_compact_snapshot(task_id)
+    if not result.get("success"):
+        return None
+
+    snapshot_text = _snapshot_text(result)
+    if not snapshot_text:
+        return None
+
+    normalized_ref = ref[1:] if ref.startswith("@") else ref
+    ref_pattern = re.compile(
+        rf"^(?P<indent>\s*).*\[ref={re.escape(normalized_ref)}\](?::)?(?:\s.*)?$"
+    )
+    url_pattern = re.compile(r'^\s*-\s+/url:\s+"?(?P<url>[^"\n]+)"?\s*$')
+    lines = snapshot_text.splitlines()
+
+    for idx, line in enumerate(lines):
+        match = ref_pattern.match(line)
+        if not match:
+            continue
+
+        base_indent = len(match.group("indent"))
+        for child_line in lines[idx + 1:]:
+            if not child_line.strip():
+                continue
+
+            child_indent = len(child_line) - len(child_line.lstrip(" "))
+            if child_indent <= base_indent:
+                break
+
+            url_match = url_pattern.match(child_line)
+            if url_match:
+                href = url_match.group("url").strip()
+                return href or None
+
+        break
+
+    return None
+
+
+def _is_invalid_ref_or_selector_error(error: Optional[str]) -> bool:
+    """Return True for ref/selector errors that should trigger a retry."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    invalid_markers = (
+        "invalid ref",
+        "invalid selector",
+        "ref invalid",
+        "selector invalid",
+        "ref not found",
+        "selector not found",
+        "ref missing",
+        "selector missing",
+        "no ref map",
+        "stale element",
+        "element not found",
+        "node not found",
+        "could not find",
+        "unable to find",
+        "not attached",
+        "unsupported token",
+        "parsing css selector",
+        "css.escape",
+    )
+    return any(marker in lowered for marker in invalid_markers)
+
+
+def _is_ambiguous_locator_error(error: Optional[str]) -> bool:
+    """Return True when a locator resolves to multiple elements."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    ambiguous_markers = (
+        "matched 2 elements",
+        "matched 3 elements",
+        "matched 4 elements",
+        "strict mode violation",
+        "resolved to",
+    )
+    return any(marker in lowered for marker in ambiguous_markers)
+
+
+def _is_command_timeout_error(error: Optional[str]) -> bool:
+    """Return True when the browser command timed out."""
+    if not error:
+        return False
+
+    lowered = error.lower()
+    return "timed out" in lowered or "timeout" in lowered
+
+
+def _is_navigable_href(href: Optional[str]) -> bool:
+    """Return True when an href should be treated as full-page navigation."""
+    if not href:
+        return False
+
+    lowered = href.strip().lower()
+    if not lowered:
+        return False
+
+    blocked_prefixes = ("#", "javascript:", "mailto:", "tel:")
+    return not lowered.startswith(blocked_prefixes)
+
+
+def _resolve_click_navigation_url(
+    task_id: str,
+    ref: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve a clicked link ref into an absolute URL when safe to navigate."""
+    href = _get_snapshot_href(task_id, ref, snapshot_result=snapshot_result)
+    if href is None:
+        href = _get_browser_attribute(task_id, ref, "href")
+    if not _is_navigable_href(href):
+        return None
+
+    parsed = urlparse(href)
+    if parsed.scheme:
+        return href
+
+    session_info = _get_session_info(task_id)
+    current_url = str(session_info.get("last_url") or "").strip()
+
+    if not current_url:
+        current_url_result = _run_browser_command(task_id, "url", [])
+        if not current_url_result.get("success"):
+            return None
+        current_url = str(current_url_result.get("data", {}).get("url") or "").strip()
+        if current_url:
+            session_info["last_url"] = current_url
+
+    if not current_url:
+        return None
+
+    return urljoin(current_url, href)
+
+
+def _resolve_select_dom_index(ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Resolve a combobox ref/selector to a DOM select index for JS fallback."""
+    if ref.startswith("@"):
+        effective_snapshot = snapshot_result or {}
+        snapshot_text = _snapshot_text(effective_snapshot)
+        if not snapshot_text:
+            return None
+        return _snapshot_ref_index(snapshot_text, ref, "combobox")
+
+    nth_match = re.search(r"nth\s*=\s*(\d+)", ref)
+    if nth_match:
+        return int(nth_match.group(1))
+
+    return None
+
+
+def _build_select_eval_script(ref: str, selected_value: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Build a DOM-level select fallback script for stubborn dropdowns."""
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if dom_index is None:
+        return None
+
+    target_value = json.dumps(selected_value)
+
+    return f"""(() => {{
+  const selects = Array.from(document.querySelectorAll("select"));
+  const preferredIndex = {dom_index};
+  const targetValue = {target_value};
+
+  const resolveMatch = (selectEl, index) => {{
+    if (!selectEl) {{
+      return null;
+    }}
+
+    const options = Array.from(selectEl.options || []);
+    const matchedOption =
+      options.find(option => String(option.value) === targetValue) ||
+      options.find(option => (option.textContent || "").trim() === targetValue);
+
+    return {{ selectEl, options, matchedOption, index }};
+  }};
+
+  let resolved = resolveMatch(selects[preferredIndex] || null, preferredIndex);
+  if (!resolved || !resolved.matchedOption) {{
+    for (let index = 0; index < selects.length; index += 1) {{
+      if (index === preferredIndex) {{
+        continue;
+      }}
+      const candidate = resolveMatch(selects[index], index);
+      if (candidate && candidate.matchedOption) {{
+        resolved = candidate;
+        break;
+      }}
+      if (!resolved && candidate) {{
+        resolved = candidate;
+      }}
+    }}
+  }}
+
+  const selectEl = resolved?.selectEl || null;
+  if (!selectEl) {{
+    return JSON.stringify({{ success: false, error: "Select element not found for DOM fallback." }});
+  }}
+
+  const matchedOption = resolved?.matchedOption || null;
+  if (!matchedOption) {{
+    return JSON.stringify({{
+      success: false,
+      error: `Option ${{targetValue}} not found in DOM fallback.`
+    }});
+  }}
+
+  selectEl.value = matchedOption.value;
+  matchedOption.selected = true;
+  selectEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  selectEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+  if (window.jQuery) {{
+    try {{
+      window.jQuery(selectEl).trigger("input");
+      window.jQuery(selectEl).trigger("change");
+    }} catch (_) {{
+      // Ignore jQuery trigger issues and rely on native events.
+    }}
+  }}
+
+  return JSON.stringify({{
+    success: true,
+    selected: matchedOption.value || targetValue,
+    matched_text: (matchedOption.textContent || "").trim(),
+    resolved_index: resolved?.index ?? preferredIndex
+  }});
+}})()"""
+
+
+def _select_via_eval(
+    task_id: str,
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fallback selection by setting the DOM value and dispatching events."""
+    script = _build_select_eval_script(ref, selected_value, snapshot_result=snapshot_result)
+    if not script:
+        return {
+            "success": False,
+            "error": "Could not resolve a stable DOM select index for fallback.",
+        }
+
+    result = _run_browser_command(task_id, "eval", [script])
+    if not result.get("success"):
+        return result
+
+    raw_result = result.get("data", {}).get("result")
+    parsed_result: Optional[Dict[str, Any]] = None
+    if isinstance(raw_result, str):
+        try:
+            maybe_parsed = json.loads(raw_result)
+            if isinstance(maybe_parsed, dict):
+                parsed_result = maybe_parsed
+        except json.JSONDecodeError:
+            parsed_result = None
+    elif isinstance(raw_result, dict):
+        parsed_result = raw_result
+
+    if parsed_result and parsed_result.get("success"):
+        return {"success": True, "data": parsed_result}
+
+    return {
+        "success": False,
+        "error": (
+            (parsed_result or {}).get("error")
+            or result.get("error")
+            or "DOM select fallback failed."
+        ),
+    }
+
+
+def _parse_eval_result_dict(raw_result: Any) -> Optional[Dict[str, Any]]:
+    """Normalize an eval command result into a dictionary when possible."""
+    if isinstance(raw_result, dict):
+        return raw_result
+
+    if isinstance(raw_result, str):
+        try:
+            parsed = json.loads(raw_result)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
+
+
+def _build_select_option_probe_script(
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build a DOM probe that checks whether a target option is selectable yet."""
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if dom_index is None:
+        return None
+
+    target_value = json.dumps(selected_value)
+
+    return f"""(() => {{
+  const selects = Array.from(document.querySelectorAll("select"));
+  const preferredIndex = {dom_index};
+  const targetValue = {target_value};
+
+  const resolveMatch = (selectEl, index) => {{
+    if (!selectEl) {{
+      return null;
+    }}
+
+    const options = Array.from(selectEl.options || []);
+    const matchedOption =
+      options.find(option => String(option.value) === targetValue) ||
+      options.find(option => (option.textContent || "").trim() === targetValue);
+
+    return {{ selectEl, options, matchedOption, index }};
+  }};
+
+  let resolved = resolveMatch(selects[preferredIndex] || null, preferredIndex);
+  if (!resolved || !resolved.matchedOption) {{
+    for (let index = 0; index < selects.length; index += 1) {{
+      if (index === preferredIndex) {{
+        continue;
+      }}
+      const candidate = resolveMatch(selects[index], index);
+      if (candidate && candidate.matchedOption) {{
+        resolved = candidate;
+        break;
+      }}
+      if (!resolved && candidate) {{
+        resolved = candidate;
+      }}
+    }}
+  }}
+
+  const selectEl = resolved?.selectEl || null;
+  if (!selectEl) {{
+    return JSON.stringify({{
+      success: false,
+      ready: false,
+      error: "Select element not found while waiting for option."
+    }});
+  }}
+
+  const matchedOption = resolved?.matchedOption || null;
+  const options = resolved?.options || Array.from(selectEl.options || []);
+
+  return JSON.stringify({{
+    success: true,
+    ready: Boolean(matchedOption) && !selectEl.disabled,
+    disabled: Boolean(selectEl.disabled),
+    matched_value: matchedOption ? String(matchedOption.value || "") : null,
+    matched_text: matchedOption ? (matchedOption.textContent || "").trim() : null,
+    option_count: options.length,
+    resolved_index: resolved?.index ?? preferredIndex
+  }});
+}})()"""
+
+
+def _wait_for_select_option(
+    task_id: str,
+    ref: str,
+    selected_value: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+    timeout_seconds: float = SELECT_OPTION_WAIT_TIMEOUT,
+) -> Dict[str, Any]:
+    """Wait briefly for a dependent dropdown option to become selectable."""
+    script = _build_select_option_probe_script(
+        ref,
+        selected_value,
+        snapshot_result=snapshot_result,
+    )
+    if not script:
+        return {"success": False, "ready": False, "error": "No stable select index available."}
+
+    deadline = time.time() + max(0.0, timeout_seconds)
+    last_result: Dict[str, Any] = {
+        "success": False,
+        "ready": False,
+        "error": "Timed out waiting for select option.",
+    }
+
+    while True:
+        probe = _run_browser_command(task_id, "eval", [script])
+        if not probe.get("success"):
+            last_result = {
+                "success": False,
+                "ready": False,
+                "error": probe.get("error", "Select readiness probe failed."),
+            }
+        else:
+            parsed = _parse_eval_result_dict(probe.get("data", {}).get("result")) or {}
+            if parsed:
+                last_result = parsed
+                if parsed.get("ready"):
+                    return parsed
+
+        if time.time() >= deadline:
+            return last_result
+
+        time.sleep(SELECT_OPTION_POLL_INTERVAL)
+
+
+def _build_row_detail_click_script(row_text: str) -> str:
+    """Build a DOM click script for icon-only detail controls inside table rows."""
+    row_text_json = json.dumps(row_text)
+    return f"""(() => {{
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  const target = normalize({row_text_json});
+  if (!target) {{
+    return JSON.stringify({{
+      success: false,
+      error: "row_text is required."
+    }});
+  }}
+
+  const isVisible = (el) => Boolean(
+    el &&
+    typeof el.getClientRects === "function" &&
+    el.getClientRects().length
+  );
+
+  const uniqueVisible = (elements) => {{
+    const seen = new Set();
+    const result = [];
+    for (const element of elements) {{
+      if (!element || seen.has(element) || !isVisible(element)) {{
+        continue;
+      }}
+      seen.add(element);
+      result.push(element);
+    }}
+    return result;
+  }};
+
+  const clickElement = (element) => {{
+    if (!element) {{
+      return false;
+    }}
+    try {{
+      element.scrollIntoView({{ block: "center", inline: "center" }});
+    }} catch (error) {{
+      // Ignore scroll failures and still attempt the click.
+    }}
+
+    const event = new MouseEvent("click", {{
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }});
+
+    if (typeof element.click === "function") {{
+      element.click();
+      return true;
+    }}
+
+    return element.dispatchEvent(event);
+  }};
+
+  const interactiveSelectors = [
+    "a[href]",
+    "button",
+    "[role='button']",
+    "input[type='button']",
+    "input[type='submit']",
+    "[onclick]"
+  ].join(",");
+  const iconSelectors = ["img", "svg", "i", "span"].join(",");
+  const rows = Array.from(document.querySelectorAll("tr, [role='row']")).filter((row) =>
+    normalize(row.innerText || row.textContent).includes(target)
+  );
+
+  if (!rows.length) {{
+    return JSON.stringify({{
+      success: false,
+      error: `No table row found matching "${{target}}".`
+    }});
+  }}
+
+  for (const row of rows) {{
+    const cells = Array.from(row.querySelectorAll("td, th"));
+    const lastCell = cells[cells.length - 1] || row;
+    const candidates = uniqueVisible([
+      ...Array.from(lastCell.querySelectorAll(interactiveSelectors)),
+      ...Array.from(lastCell.querySelectorAll(iconSelectors)),
+      ...Array.from(row.querySelectorAll(interactiveSelectors)),
+    ]);
+
+    const clicked = candidates[candidates.length - 1] || null;
+    if (!clicked) {{
+      continue;
+    }}
+
+    if (!clickElement(clicked)) {{
+      continue;
+    }}
+
+    return JSON.stringify({{
+      success: true,
+      row_text: {row_text_json},
+      matched_row_text: String(row.innerText || row.textContent || "").replace(/\\s+/g, " ").trim(),
+      clicked_tag: String(clicked.tagName || "").toLowerCase(),
+      clicked_text: String(clicked.innerText || clicked.textContent || "").replace(/\\s+/g, " ").trim() || null,
+      clicked_href: typeof clicked.getAttribute === "function" ? clicked.getAttribute("href") : null,
+    }});
+  }}
+
+  return JSON.stringify({{
+    success: false,
+    error: `No clickable detail control found in row matching "${{target}}".`
+  }});
+}})()"""
+
+
+def _build_visible_table_extract_script(heading_text: Optional[str] = None) -> str:
+    """Build a DOM extraction script for a visible table near a heading."""
+    heading_text_json = json.dumps(heading_text or "")
+    return f"""(() => {{
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  const targetHeading = normalize({heading_text_json});
+
+  const isVisible = (el) => Boolean(
+    el &&
+    typeof el.getClientRects === "function" &&
+    el.getClientRects().length
+  );
+
+  const textOf = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+
+  const getRowCells = (row) => {{
+    const roleCells = Array.from(row.querySelectorAll(":scope > [role='cell'], :scope > [role='columnheader']"));
+    if (roleCells.length) {{
+      return roleCells;
+    }}
+    return Array.from(row.querySelectorAll(":scope > td, :scope > th"));
+  }};
+
+  const getRows = (tableEl) => {{
+    if (!tableEl) {{
+      return [];
+    }}
+    const rows = Array.from(tableEl.querySelectorAll("tr, [role='row']"))
+      .filter((row) => isVisible(row) && getRowCells(row).length);
+    if (rows.length) {{
+      return rows;
+    }}
+    if (isVisible(tableEl) && getRowCells(tableEl).length) {{
+      return [tableEl];
+    }}
+    return [];
+  }};
+
+  const extractTable = (tableEl, headingEl = null) => {{
+    const rows = getRows(tableEl);
+    if (!rows.length) {{
+      return null;
+    }}
+
+    let headerCells = [];
+    let dataRows = rows.slice();
+    for (const row of rows) {{
+      const cells = getRowCells(row);
+      const explicitHeaders = cells.filter((cell) =>
+        (cell.getAttribute && cell.getAttribute("role") === "columnheader") ||
+        String(cell.tagName || "").toLowerCase() === "th"
+      );
+      if (explicitHeaders.length) {{
+        headerCells = explicitHeaders;
+        dataRows = rows.filter((candidate) => candidate !== row);
+        break;
+      }}
+    }}
+
+    const visibleDataRows = dataRows.filter((row) => {{
+      const values = getRowCells(row).map((cell) => textOf(cell.innerText || cell.textContent));
+      return values.some(Boolean);
+    }});
+
+    const headerTexts = headerCells
+      .map((cell) => textOf(cell.innerText || cell.textContent))
+      .filter(Boolean);
+
+    const maxCellCount = visibleDataRows.reduce((maxCount, row) => {{
+      return Math.max(maxCount, getRowCells(row).length);
+    }}, headerTexts.length);
+
+    const headers = Array.from({{ length: maxCellCount }}, (_, index) =>
+      headerTexts[index] || `col_${{index + 1}}`
+    );
+
+    const structuredRows = visibleDataRows.map((row) => {{
+      const values = getRowCells(row)
+        .map((cell) => textOf(cell.innerText || cell.textContent))
+        .slice(0, headers.length);
+      const mapped = {{}};
+      headers.forEach((header, index) => {{
+        mapped[header] = values[index] || "";
+      }});
+      return mapped;
+    }});
+
+    return {{
+      success: true,
+      heading_text: headingEl ? textOf(headingEl.innerText || headingEl.textContent) : null,
+      headers,
+      rows: structuredRows,
+      row_count: structuredRows.length
+    }};
+  }};
+
+  const candidateElements = Array.from(document.querySelectorAll("table, [role='table'], tbody, [role='rowgroup']"));
+  const visibleCandidates = candidateElements.filter((element) => isVisible(element) && getRows(element).length);
+
+  const evaluateCandidate = (tableEl, headingEl = null) => {{
+    const extracted = extractTable(tableEl, headingEl);
+    if (!extracted || !extracted.row_count) {{
+      return null;
+    }}
+    return extracted;
+  }};
+
+  if (targetHeading) {{
+    const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, h6, [role='heading']"))
+      .filter((heading) => isVisible(heading))
+      .filter((heading) => normalize(heading.innerText || heading.textContent).includes(targetHeading));
+
+    for (const heading of headings) {{
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+      let node = walker.currentNode;
+      while (node && node !== heading) {{
+        node = walker.nextNode();
+      }}
+      while ((node = walker.nextNode())) {{
+        if (!(node instanceof Element) || !isVisible(node)) {{
+          continue;
+        }}
+        const directMatch = (
+          node.matches("table, [role='table'], tbody, [role='rowgroup']") ? node : null
+        );
+        const nestedMatch = directMatch || node.querySelector("table, [role='table'], tbody, [role='rowgroup']");
+        const candidate = nestedMatch && isVisible(nestedMatch) ? nestedMatch : null;
+        if (!candidate) {{
+          continue;
+        }}
+        const extracted = evaluateCandidate(candidate, heading);
+        if (extracted) {{
+          return JSON.stringify(extracted);
+        }}
+      }}
+    }}
+
+    return JSON.stringify({{
+      success: false,
+      error: `No visible table found after heading "${{targetHeading}}".`
+    }});
+  }}
+
+  let best = null;
+  for (const candidate of visibleCandidates) {{
+    const extracted = evaluateCandidate(candidate, null);
+    if (!extracted) {{
+      continue;
+    }}
+    if (!best || extracted.row_count > best.row_count) {{
+      best = extracted;
+    }}
+  }}
+
+  if (best) {{
+    return JSON.stringify(best);
+  }}
+
+  return JSON.stringify({{
+    success: false,
+    error: "No visible table found on the current page."
+  }});
+}})()"""
+
+
 # ============================================================================
 # Browser Tool Functions
 # ============================================================================
@@ -987,6 +1980,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         data = result.get("data", {})
         title = data.get("title", "")
         final_url = data.get("url", url)
+        session_info["last_url"] = final_url
         
         response = {
             "success": True,
@@ -1022,6 +2016,21 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
                     "Consider upgrading Browserbase plan for proxy support."
                 )
             response["stealth_features"] = active_features
+
+        # Auto-snapshot: include compact page snapshot after successful navigation
+        # so the model always receives element refs without a separate snapshot call.
+        try:
+            snap_result = _run_browser_command(effective_task_id, "snapshot", ["-c"])
+            if snap_result.get("success"):
+                snap_data = snap_result.get("data", {})
+                snapshot_text = snap_data.get("snapshot", "")
+                refs = snap_data.get("refs", {})
+                if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+                    snapshot_text = snapshot_text[:SNAPSHOT_SUMMARIZE_THRESHOLD] + "\n[...truncated]"
+                response["snapshot"] = snapshot_text
+                response["element_count"] = len(refs) if isinstance(refs, dict) else 0
+        except Exception:
+            pass  # Navigation succeeded even if snapshot fails.
         
         return json.dumps(response, ensure_ascii=False)
     else:
@@ -1093,12 +2102,33 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         JSON string with click result
     """
     effective_task_id = task_id or "default"
-    
-    # Ensure ref starts with @
-    if not ref.startswith("@"):
-        ref = f"@{ref}"
-    
+
+    ref = _normalize_browser_ref(ref)
+
+    snapshot_result = _get_compact_snapshot(effective_task_id)
+
+    target_url = _resolve_click_navigation_url(
+        effective_task_id,
+        ref,
+        snapshot_result=snapshot_result,
+    )
+    if target_url:
+        navigation_result = browser_navigate(target_url, task_id=effective_task_id)
+        try:
+            navigation_data = json.loads(navigation_result)
+        except json.JSONDecodeError:
+            return navigation_result
+
+        if navigation_data.get("success"):
+            navigation_data["clicked"] = ref
+            navigation_data["navigated"] = True
+
+        return json.dumps(navigation_data, ensure_ascii=False)
+
     result = _run_browser_command(effective_task_id, "click", [ref])
+    if not result.get("success") and _is_invalid_ref_or_selector_error(result.get("error")):
+        snapshot_result = _get_compact_snapshot(effective_task_id)
+        result = _run_browser_command(effective_task_id, "click", [ref])
     
     if result.get("success"):
         return json.dumps({
@@ -1110,6 +2140,207 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
             "success": False,
             "error": result.get("error", f"Failed to click {ref}")
         }, ensure_ascii=False)
+
+
+def browser_select(
+    ref: str,
+    value: Optional[str] = None,
+    option_ref: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Select an option in a dropdown.
+
+    Args:
+        ref: Select element reference (e.g., "@e5")
+        value: Option label/value to select
+        option_ref: Option element reference to resolve from the snapshot
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with select result
+    """
+    effective_task_id = task_id or "default"
+    ref = _normalize_browser_ref(ref)
+
+    has_value = bool(value and str(value).strip())
+    has_option_ref = bool(option_ref and str(option_ref).strip())
+    if has_value == has_option_ref:
+        return json.dumps({
+            "success": False,
+            "error": "Provide exactly one of 'value' or 'option_ref'."
+        }, ensure_ascii=False)
+
+    snapshot_result = _get_compact_snapshot(effective_task_id)
+    if not snapshot_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": snapshot_result.get("error", "Failed to hydrate browser snapshot")
+        }, ensure_ascii=False)
+
+    selected_value = str(value).strip() if has_value else ""
+    if has_option_ref:
+        selected_value = _resolve_select_option_value(
+            effective_task_id,
+            str(option_ref).strip(),
+            snapshot_result=snapshot_result,
+        ) or ""
+    if selected_value:
+        selected_value = _resolve_select_value_from_label(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
+
+    if not selected_value:
+        return json.dumps({
+            "success": False,
+            "error": "Could not resolve the requested option from the current snapshot."
+        }, ensure_ascii=False)
+
+    snapshot_text = _snapshot_text(snapshot_result)
+    wait_result: Optional[Dict[str, Any]] = None
+    if snapshot_text.count("combobox") > 1:
+        wait_result = _wait_for_select_option(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
+        matched_value = str(wait_result.get("matched_value") or "").strip()
+        if matched_value:
+            selected_value = matched_value
+        elif wait_result.get("disabled") or int(wait_result.get("option_count") or 0) == 0:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Option {selected_value} is not available yet; "
+                    "the dropdown is still disabled or its options have not loaded."
+                ),
+            }, ensure_ascii=False)
+
+    dom_index = _resolve_select_dom_index(ref, snapshot_result=snapshot_result)
+    if has_option_ref and wait_result and wait_result.get("ready") and dom_index not in (None, 0):
+        eval_result = _select_via_eval(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=snapshot_result,
+        )
+        if eval_result.get("success"):
+            return json.dumps({
+                "success": True,
+                "selected": selected_value,
+                "element": ref,
+            }, ensure_ascii=False)
+
+    result = _run_browser_command(effective_task_id, "select", [ref, selected_value])
+    fallback_snapshot = snapshot_result
+    if not result.get("success") and (
+        _is_invalid_ref_or_selector_error(result.get("error"))
+        or _is_ambiguous_locator_error(result.get("error"))
+    ):
+        retry_snapshot = _get_compact_snapshot(effective_task_id)
+        fallback_snapshot = retry_snapshot if retry_snapshot.get("success") else snapshot_result
+        retry_ref = ref
+        if _is_ambiguous_locator_error(result.get("error")):
+            retry_ref = _resolve_combobox_selector(
+                effective_task_id,
+                ref,
+                snapshot_result=retry_snapshot,
+            ) or ref
+        result = _run_browser_command(effective_task_id, "select", [retry_ref, selected_value])
+
+    if not result.get("success") and _is_command_timeout_error(result.get("error")):
+        result = _select_via_eval(
+            effective_task_id,
+            ref,
+            selected_value,
+            snapshot_result=fallback_snapshot,
+        )
+
+    if result.get("success"):
+        return json.dumps({
+            "success": True,
+            "selected": selected_value,
+            "element": ref,
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": result.get("error", f"Failed to select {selected_value} in {ref}")
+    }, ensure_ascii=False)
+
+
+def browser_click_row_detail(row_text: str, task_id: Optional[str] = None) -> str:
+    """
+    Click the rightmost interactive control in a table row matching row_text.
+
+    Args:
+        row_text: Text that identifies the row
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with click result
+    """
+    effective_task_id = task_id or "default"
+    target_row = str(row_text or "").strip()
+    if not target_row:
+        return json.dumps({
+            "success": False,
+            "error": "row_text is required."
+        }, ensure_ascii=False)
+
+    script = _build_row_detail_click_script(target_row)
+    result = _run_browser_command(effective_task_id, "eval", [script])
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", f"Failed to click detail for row {target_row}")
+        }, ensure_ascii=False)
+
+    parsed = _parse_eval_result_dict(result.get("data", {}).get("result"))
+    if parsed and parsed.get("success"):
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": (parsed or {}).get("error", f"Failed to click detail for row {target_row}")
+    }, ensure_ascii=False)
+
+
+def browser_extract_visible_table(
+    heading_text: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Extract a visible table into structured headers and rows.
+
+    Args:
+        heading_text: Optional heading text used to locate the target table
+        task_id: Task identifier for session isolation
+
+    Returns:
+        JSON string with structured table data
+    """
+    effective_task_id = task_id or "default"
+    script = _build_visible_table_extract_script(heading_text=heading_text)
+    result = _run_browser_command(effective_task_id, "eval", [script])
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Failed to extract visible table")
+        }, ensure_ascii=False)
+
+    parsed = _parse_eval_result_dict(result.get("data", {}).get("result"))
+    if parsed and parsed.get("success"):
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": (parsed or {}).get("error", "Failed to extract visible table")
+    }, ensure_ascii=False)
 
 
 def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -1786,6 +3017,41 @@ registry.register(
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
+)
+registry.register(
+    name="browser_select",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_select"],
+    handler=lambda args, **kw: browser_select(
+        ref=args.get("ref", ""),
+        value=args.get("value"),
+        option_ref=args.get("option_ref"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🗂️",
+)
+registry.register(
+    name="browser_click_row_detail",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_click_row_detail"],
+    handler=lambda args, **kw: browser_click_row_detail(
+        row_text=args.get("row_text", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🔎",
+)
+registry.register(
+    name="browser_extract_visible_table",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_extract_visible_table"],
+    handler=lambda args, **kw: browser_extract_visible_table(
+        heading_text=args.get("heading_text"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📋",
 )
 registry.register(
     name="browser_type",

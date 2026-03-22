@@ -277,6 +277,37 @@ def _resolve_gateway_model() -> str:
     return model
 
 
+def _resolve_gateway_max_tokens() -> int:
+    """Resolve a conservative output cap for gateway-created agent instances."""
+    raw_env = os.getenv("HERMES_MAX_OUTPUT_TOKENS", "").strip()
+    if raw_env:
+        try:
+            parsed_env = int(raw_env)
+            if parsed_env > 0:
+                return parsed_env
+        except Exception:
+            pass
+
+    try:
+        import yaml as _y
+
+        _cfg_path = _hermes_home / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _y.safe_load(_f) or {}
+            _agent_cfg = _cfg.get("agent", {})
+            if isinstance(_agent_cfg, dict):
+                raw_cfg = _agent_cfg.get("max_output_tokens")
+                if raw_cfg is not None:
+                    parsed_cfg = int(raw_cfg)
+                    if parsed_cfg > 0:
+                        return parsed_cfg
+    except Exception:
+        pass
+
+    return 4096
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -531,6 +562,7 @@ class GatewayRunner:
                 **runtime_kwargs,
                 model=model,
                 max_iterations=8,
+                max_tokens=_resolve_gateway_max_tokens(),
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
@@ -1805,6 +1837,7 @@ class GatewayRunner:
                                     **_hyg_runtime,
                                     model=_hyg_model,
                                     max_iterations=4,
+                                    max_tokens=_resolve_gateway_max_tokens(),
                                     quiet_mode=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
@@ -3338,6 +3371,7 @@ class GatewayRunner:
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    max_tokens=_resolve_gateway_max_tokens(),
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -3542,6 +3576,7 @@ class GatewayRunner:
                 **runtime_kwargs,
                 model=model,
                 max_iterations=4,
+                max_tokens=_resolve_gateway_max_tokens(),
                 quiet_mode=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
@@ -4717,6 +4752,7 @@ class GatewayRunner:
                 model=turn_route["model"],
                 **turn_route["runtime"],
                 max_iterations=max_iterations,
+                max_tokens=_resolve_gateway_max_tokens(),
                 quiet_mode=True,
                 verbose_logging=False,
                 enabled_toolsets=enabled_toolsets,

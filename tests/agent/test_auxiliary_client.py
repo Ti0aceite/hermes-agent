@@ -593,6 +593,26 @@ class TestTaskSpecificOverrides:
             client, model = get_text_auxiliary_client("compression")
         assert model == "google/gemini-3-flash-preview"  # auto → OpenRouter
 
+    def test_flush_memories_can_be_pinned_to_custom_openai_from_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            """auxiliary:
+  flush_memories:
+    provider: custom
+    model: gpt-4.1-mini
+    base_url: https://api.openai.com/v1
+"""
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = get_text_auxiliary_client("flush_memories")
+        assert model == "gpt-4.1-mini"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
+        assert mock_openai.call_args.kwargs["api_key"] == "openai-key"
+
     def test_compression_summary_base_url_from_config(self, monkeypatch, tmp_path):
         """compression.summary_base_url should produce a custom-endpoint client."""
         hermes_home = tmp_path / "hermes"

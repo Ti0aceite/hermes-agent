@@ -224,6 +224,7 @@ class TestRunBackgroundTask:
 
             await runner._run_background_task("say hello", source, "bg_test")
 
+        assert MockAgent.call_args.kwargs["max_tokens"] == 4096
         # Should have sent the result
         mock_adapter.send.assert_called_once()
         call_args = mock_adapter.send.call_args

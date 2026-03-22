@@ -468,6 +468,68 @@ class TestInit:
             )
 
 
+class TestBackgroundReview:
+    def test_background_review_inherits_runtime_config(self):
+        captured = {}
+
+        class DummyRotatingFileHandler(logging.Handler):
+            def __init__(self, filename, *args, **kwargs):
+                super().__init__()
+                self.baseFilename = filename
+
+            def emit(self, record):
+                return None
+
+        class InlineThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self._target = target
+                self.daemon = daemon
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        class FakeReviewAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._session_messages = []
+
+            def run_conversation(self, user_message, conversation_history=None):
+                return {"final_response": "Nothing to save."}
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.ContextCompressor"),
+            patch("logging.handlers.RotatingFileHandler", DummyRotatingFileHandler),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://api.openai.com/v1",
+                provider="custom",
+                api_mode="codex_responses",
+                max_tokens=4096,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="telegram",
+            )
+
+        with (
+            patch("run_agent.AIAgent", FakeReviewAgent),
+            patch("threading.Thread", InlineThread),
+        ):
+            agent._spawn_background_review([], review_skills=True)
+
+        assert captured["provider"] == "custom"
+        assert captured["base_url"] == "https://api.openai.com/v1"
+        assert captured["api_key"] == "test-key-1234567890"
+        assert captured["api_mode"] == "codex_responses"
+        assert captured["max_tokens"] == 4096
+        assert captured["platform"] == "telegram"
+
+
 class TestInterrupt:
     def test_interrupt_sets_flag(self, agent):
         with patch("run_agent._set_interrupt"):
