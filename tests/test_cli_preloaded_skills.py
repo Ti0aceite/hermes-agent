@@ -22,6 +22,7 @@ def _make_real_cli(**kwargs):
     clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
     prompt_toolkit_stubs = {
         "prompt_toolkit": MagicMock(),
+        "prompt_toolkit.auto_suggest": MagicMock(),
         "prompt_toolkit.history": MagicMock(),
         "prompt_toolkit.styles": MagicMock(),
         "prompt_toolkit.patch_stdout": MagicMock(),
@@ -104,6 +105,37 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
 
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
         cli_mod.main(skills="missing-skill", list_tools=True)
+
+
+def test_main_applies_auto_preloaded_skills_from_matching_query(monkeypatch):
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_auto_preloaded_skills_prompt",
+        lambda config, platform, message, task_id=None: (
+            "auto skill prompt",
+            ["dentidesk-confirmacion-citas"],
+            [],
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(
+            q="Dame la lista de pacientes que se deben confirmar para mañana",
+            list_tools=True,
+        )
+
+    cli_obj = created["cli"]
+    assert cli_obj.system_prompt == "base prompt\n\nauto skill prompt"
+    assert cli_obj.preloaded_skills == ["dentidesk-confirmacion-citas"]
 
 
 def test_show_banner_prints_preloaded_skills_once_before_banner():

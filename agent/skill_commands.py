@@ -280,3 +280,93 @@ def build_preloaded_skills_prompt(
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing
+
+
+def build_auto_preloaded_skills_prompt(
+    config: dict[str, Any] | None,
+    platform: str | None,
+    user_message: str | None,
+    *,
+    task_id: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Resolve config-driven auto-preloaded skills for a message.
+
+    Config schema:
+
+      skills:
+        auto_preload_rules:
+          - platforms: [telegram, cli]
+            contains_any: ["pacientes por confirmar", "lista para llamar"]
+            skills: ["dentidesk-confirmacion-citas"]
+
+    Rules are evaluated in order and matching skills are merged/deduplicated.
+    """
+    if not isinstance(config, dict):
+        return "", [], []
+
+    text = " ".join((user_message or "").strip().lower().split())
+    if not text:
+        return "", [], []
+
+    skills_cfg = config.get("skills", {})
+    if not isinstance(skills_cfg, dict):
+        return "", [], []
+
+    rules = skills_cfg.get("auto_preload_rules", [])
+    if not isinstance(rules, list):
+        return "", [], []
+
+    normalized_platform = (platform or "").strip().lower()
+    selected_skills: list[str] = []
+    seen: set[str] = set()
+
+    def _normalize_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value if item is not None]
+        return [str(value)]
+
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+
+        rule_platforms = [
+            item.strip().lower()
+            for item in _normalize_list(rule.get("platforms"))
+            if item and item.strip()
+        ]
+        if rule_platforms and normalized_platform not in rule_platforms:
+            continue
+
+        contains_any = [
+            item.strip().lower()
+            for item in _normalize_list(rule.get("contains_any"))
+            if item and item.strip()
+        ]
+        contains_all = [
+            item.strip().lower()
+            for item in _normalize_list(rule.get("contains_all"))
+            if item and item.strip()
+        ]
+
+        if contains_any and not any(term in text for term in contains_any):
+            continue
+        if contains_all and not all(term in text for term in contains_all):
+            continue
+        if not contains_any and not contains_all:
+            continue
+
+        for skill_name in _normalize_list(rule.get("skills")):
+            normalized_skill = skill_name.strip()
+            if not normalized_skill or normalized_skill in seen:
+                continue
+            seen.add(normalized_skill)
+            selected_skills.append(normalized_skill)
+
+    if not selected_skills:
+        return "", [], []
+
+    return build_preloaded_skills_prompt(selected_skills, task_id=task_id)

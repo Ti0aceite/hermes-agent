@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    build_auto_preloaded_skills_prompt,
     build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
@@ -126,6 +127,56 @@ class TestBuildPreloadedSkillsPrompt:
         assert "present-skill" in prompt
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
+
+
+class TestBuildAutoPreloadedSkillsPrompt:
+    def test_matches_platform_and_keywords(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dentidesk-confirmacion-citas")
+            config = {
+                "skills": {
+                    "auto_preload_rules": [
+                        {
+                            "platforms": ["telegram", "cli"],
+                            "contains_any": ["pacientes por confirmar", "lista para llamar"],
+                            "skills": ["dentidesk-confirmacion-citas"],
+                        }
+                    ]
+                }
+            }
+            prompt, loaded, missing = build_auto_preloaded_skills_prompt(
+                config,
+                "telegram",
+                "Dame la lista de pacientes por confirmar para mañana",
+            )
+
+        assert missing == []
+        assert loaded == ["dentidesk-confirmacion-citas"]
+        assert "dentidesk-confirmacion-citas" in prompt
+
+    def test_ignores_non_matching_platform(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dentidesk-confirmacion-citas")
+            config = {
+                "skills": {
+                    "auto_preload_rules": [
+                        {
+                            "platforms": ["telegram"],
+                            "contains_any": ["pacientes por confirmar"],
+                            "skills": ["dentidesk-confirmacion-citas"],
+                        }
+                    ]
+                }
+            }
+            prompt, loaded, missing = build_auto_preloaded_skills_prompt(
+                config,
+                "cli",
+                "Dame la lista de pacientes por confirmar para mañana",
+            )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
 
 
 class TestBuildSkillInvocationMessage:

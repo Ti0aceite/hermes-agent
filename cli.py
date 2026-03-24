@@ -887,6 +887,7 @@ from agent.skill_commands import (
     get_skill_commands,
     build_skill_invocation_message,
     build_plan_path,
+    build_auto_preloaded_skills_prompt,
     build_preloaded_skills_prompt,
 )
 
@@ -7227,6 +7228,21 @@ def main(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
             cli.preloaded_skills = loaded_skills
+    elif query:
+        auto_prompt, auto_loaded, auto_missing = build_auto_preloaded_skills_prompt(
+            CLI_CONFIG,
+            "cli",
+            query,
+            task_id=cli.session_id,
+        )
+        if auto_missing:
+            missing_display = ", ".join(auto_missing)
+            raise ValueError(f"Unknown skill(s): {missing_display}")
+        if auto_prompt:
+            cli.system_prompt = "\n\n".join(
+                part for part in (cli.system_prompt, auto_prompt) if part
+            ).strip()
+            cli.preloaded_skills = auto_loaded
 
     # Inject worktree context into agent's system prompt
     if wt_info:
