@@ -375,6 +375,36 @@ class TestBrowserClickRowDetail:
         assert result["success"] is True
         assert result["clicked_tag"] == "a"
 
+    def test_click_row_detail_supports_no_confirmado_estado_rows(self):
+        from tools.browser_tool import browser_click_row_detail
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": True,
+                            "row_text": "No confirmado",
+                            "matched_row_text": "No confirmado 2",
+                            "clicked_tag": "a",
+                            "clicked_href": "javascript:void(0)",
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_click_row_detail("No confirmado", task_id="dentidesk")
+            )
+
+        assert mock_cmd.call_count == 1
+        assert mock_cmd.call_args[0][0] == "dentidesk"
+        assert mock_cmd.call_args[0][1] == "eval"
+        assert "No confirmado" in mock_cmd.call_args[0][2][0]
+        assert result["success"] is True
+        assert result["matched_row_text"] == "No confirmado 2"
+
     def test_click_row_detail_returns_eval_error_when_no_control_found(self):
         from tools.browser_tool import browser_click_row_detail
 
@@ -441,6 +471,95 @@ class TestBrowserClickRowDetail:
         assert result["success"] is True
         assert result["row_count"] == 2
         assert result["rows"][0]["Nombre Paciente"] == "AGUERO SOTO SILVIA VANESA"
+
+    def test_extract_visible_table_supports_no_confirmado_detail_heading(self):
+        from tools.browser_tool import browser_extract_visible_table
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": True,
+                            "heading_text": "Detalle estado No confirmado",
+                            "headers": [
+                                "Nombre Paciente",
+                                "Hora",
+                                "Nombre Profesional",
+                                "Teléfono Celular",
+                            ],
+                            "rows": [
+                                {
+                                    "Nombre Paciente": "Boris Carrasco Elgueta",
+                                    "Hora": "10:30",
+                                    "Nombre Profesional": "Dr. Felipe Leal Gomez",
+                                    "Teléfono Celular": "973057184",
+                                },
+                                {
+                                    "Nombre Paciente": "Pia Ojeda Segovia",
+                                    "Hora": "11:40",
+                                    "Nombre Profesional": "Dr. Felipe Leal Gomez",
+                                    "Teléfono Celular": "920487179",
+                                },
+                            ],
+                            "row_count": 2,
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_extract_visible_table(
+                    heading_text="Detalle estado No confirmado",
+                    task_id="dentidesk",
+                )
+            )
+
+        assert mock_cmd.call_count == 1
+        assert mock_cmd.call_args[0][0] == "dentidesk"
+        assert mock_cmd.call_args[0][1] == "eval"
+        assert result["success"] is True
+        assert result["heading_text"] == "Detalle estado No confirmado"
+        assert result["row_count"] == 2
+        assert result["rows"][0]["Nombre Paciente"] == "Boris Carrasco Elgueta"
+
+    def test_extract_visible_table_supports_short_no_confirmado_heading(self):
+        from tools.browser_tool import browser_extract_visible_table
+
+        with patch("tools.browser_tool._run_browser_command") as mock_cmd:
+            mock_cmd.return_value = {
+                "success": True,
+                "data": {
+                    "result": json.dumps(
+                        {
+                            "success": True,
+                            "heading_text": "No confirmado",
+                            "headers": ["Nombre Paciente", "Hora", "Teléfono Celular"],
+                            "rows": [
+                                {
+                                    "Nombre Paciente": "Nathalie Pradenas Barria",
+                                    "Hora": "15:00",
+                                    "Teléfono Celular": "937612324",
+                                }
+                            ],
+                            "row_count": 1,
+                        }
+                    )
+                },
+            }
+
+            result = json.loads(
+                browser_extract_visible_table(
+                    heading_text="No confirmado",
+                    task_id="dentidesk",
+                )
+            )
+
+        assert result["success"] is True
+        assert result["heading_text"] == "No confirmado"
+        assert result["row_count"] == 1
+        assert result["rows"][0]["Nombre Paciente"] == "Nathalie Pradenas Barria"
 
     def test_extract_visible_table_returns_error_when_missing(self):
         from tools.browser_tool import browser_extract_visible_table
