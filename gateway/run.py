@@ -4708,6 +4708,33 @@ class GatewayRunner:
             combined_ephemeral = context_prompt or ""
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            try:
+                from agent.skill_commands import build_auto_preloaded_skills_prompt
+                from hermes_cli.config import load_config as _load_hermes_config
+
+                auto_prompt, auto_loaded, auto_missing = build_auto_preloaded_skills_prompt(
+                    _load_hermes_config(),
+                    platform_key,
+                    message,
+                    task_id=session_id,
+                )
+                if auto_missing:
+                    logger.warning(
+                        "Auto-preloaded skill(s) not found for %s: %s",
+                        platform_key,
+                        ", ".join(auto_missing),
+                    )
+                if auto_prompt:
+                    combined_ephemeral = "\n\n".join(
+                        part for part in (combined_ephemeral, auto_prompt) if part
+                    ).strip()
+                    logger.info(
+                        "Auto-preloaded skills for %s: %s",
+                        platform_key,
+                        ", ".join(auto_loaded),
+                    )
+            except Exception as _auto_skill_exc:
+                logger.debug("Could not resolve auto-preloaded skills: %s", _auto_skill_exc)
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
