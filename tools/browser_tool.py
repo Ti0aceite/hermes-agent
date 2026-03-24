@@ -95,6 +95,8 @@ DEFAULT_SESSION_TIMEOUT = 300
 
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+SNAPSHOT_STABILIZE_DELAYS = (0.0, 1.0, 2.0)
+EDITABLE_SNAPSHOT_ROLE_MARKERS = ("textbox", "searchbox", "textarea", "input")
 
 # Dependent dropdowns in apps like Dentidesk sometimes populate a moment after
 # the first select fires its change event. Wait briefly before giving up.
@@ -401,13 +403,18 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 8000 chars are truncated or LLM-summarized. Requires browser_navigate first.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. stabilize=true retries the snapshot over a short window and returns the richest successful result, which helps with pages that finish rendering asynchronously after navigation or form submission. Snapshots over 8000 chars are truncated or LLM-summarized. Requires browser_navigate first.",
         "parameters": {
             "type": "object",
             "properties": {
                 "full": {
                     "type": "boolean",
                     "description": "If true, returns complete page content. If false (default), returns compact view with interactive elements only.",
+                    "default": False
+                },
+                "stabilize": {
+                    "type": "boolean",
+                    "description": "If true, retries snapshot capture over a short window and returns the richest successful result. Use this for pages that populate content asynchronously after selecting filters or clicking submit.",
                     "default": False
                 }
             },
@@ -1304,6 +1311,8 @@ def _is_invalid_ref_or_selector_error(error: Optional[str]) -> bool:
         "no ref map",
         "stale element",
         "element not found",
+        "not found or not visible",
+        "not visible",
         "node not found",
         "could not find",
         "unable to find",
@@ -1398,6 +1407,44 @@ def _resolve_select_dom_index(ref: str, snapshot_result: Optional[Dict[str, Any]
     nth_match = re.search(r"nth\s*=\s*(\d+)", ref)
     if nth_match:
         return int(nth_match.group(1))
+
+    return None
+
+
+def _resolve_editable_dom_index(ref: str, snapshot_result: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Resolve an editable ref to a DOM index among visible text-entry controls."""
+    if not ref.startswith("@"):
+        return None
+
+    effective_snapshot = snapshot_result or {}
+    snapshot_text = _snapshot_text(effective_snapshot)
+    if not snapshot_text:
+        return None
+
+    refs = _snapshot_refs(effective_snapshot)
+    entry = refs.get(ref[1:]) or refs.get(ref)
+    tokens: List[str] = []
+
+    if isinstance(entry, dict):
+        role = str(entry.get("role") or "").strip().lower()
+        if role:
+            tokens.append(role)
+
+    line = _find_snapshot_ref_line(snapshot_text, ref)
+    if line:
+        lowered_line = line.lower()
+        for marker in EDITABLE_SNAPSHOT_ROLE_MARKERS:
+            if marker in lowered_line and marker not in tokens:
+                tokens.append(marker)
+
+    for marker in EDITABLE_SNAPSHOT_ROLE_MARKERS:
+        if marker not in tokens:
+            tokens.append(marker)
+
+    for token in tokens:
+        index = _snapshot_ref_index(snapshot_text, ref, token)
+        if index is not None:
+            return index
 
     return None
 
@@ -1522,6 +1569,244 @@ def _select_via_eval(
             or "DOM select fallback failed."
         ),
     }
+
+
+def _build_fill_eval_script(
+    preferred_index: Optional[int],
+    typed_text: str,
+    preferred_label: Optional[str] = None,
+) -> str:
+    """Build a DOM-level fill fallback script for dynamic editable controls."""
+    target_value = json.dumps(typed_text)
+    target_label = json.dumps(preferred_label or "")
+    preferred_index_literal = "null" if preferred_index is None else str(preferred_index)
+
+    return f"""(() => {{
+  const normalize = (value) => String(value || "")
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  const isVisible = (el) => Boolean(
+    el &&
+    typeof el.getClientRects === "function" &&
+    el.getClientRects().length
+  );
+
+  const getLabelText = (el) => {{
+    if (!el) {{
+      return "";
+    }}
+    const directAttrs = [
+      el.getAttribute && el.getAttribute("aria-label"),
+      el.getAttribute && el.getAttribute("placeholder"),
+      el.getAttribute && el.getAttribute("title"),
+      el.name,
+      el.id,
+    ];
+    for (const value of directAttrs) {{
+      if (String(value || "").trim()) {{
+        return String(value).trim();
+      }}
+    }}
+
+    if (el.id) {{
+      const label = document.querySelector(`label[for="${{CSS.escape(el.id)}}"]`);
+      if (label && String(label.textContent || "").trim()) {{
+        return String(label.textContent).trim();
+      }}
+    }}
+
+    const wrappingLabel = el.closest("label");
+    if (wrappingLabel && String(wrappingLabel.textContent || "").trim()) {{
+      return String(wrappingLabel.textContent).trim();
+    }}
+
+    return "";
+  }};
+
+  const setNativeValue = (el, nextValue) => {{
+    if (el && "value" in el) {{
+      const descriptor =
+        Object.getOwnPropertyDescriptor(el.constructor?.prototype || {{}}, "value") ||
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value") ||
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+      if (descriptor && typeof descriptor.set === "function") {{
+        descriptor.set.call(el, nextValue);
+        return;
+      }}
+      el.value = nextValue;
+      return;
+    }}
+
+    if (el && el.isContentEditable) {{
+      el.textContent = nextValue;
+    }}
+  }};
+
+  const targetValue = {target_value};
+  const normalizedTargetLabel = normalize({target_label});
+  const preferredIndex = {preferred_index_literal};
+
+  const candidates = Array.from(document.querySelectorAll(
+    'input:not([type="hidden"]):not([disabled]), textarea:not([disabled]), [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"]'
+  )).filter(isVisible);
+
+  if (!candidates.length) {{
+    return JSON.stringify({{ success: false, error: "No visible editable elements found for DOM fill fallback." }});
+  }}
+
+  const labeledCandidate = normalizedTargetLabel
+    ? candidates.find((candidate) => normalize(getLabelText(candidate)).includes(normalizedTargetLabel))
+    : null;
+
+  let resolved = null;
+  if (Number.isInteger(preferredIndex) && preferredIndex >= 0 && preferredIndex < candidates.length) {{
+    resolved = candidates[preferredIndex];
+  }}
+  if ((!resolved || !isVisible(resolved)) && labeledCandidate) {{
+    resolved = labeledCandidate;
+  }}
+  if (!resolved && candidates.length === 1) {{
+    resolved = candidates[0];
+  }}
+  if (!resolved) {{
+    return JSON.stringify({{
+      success: false,
+      error: "Editable element not found for DOM fill fallback."
+    }});
+  }}
+
+  try {{
+    if (typeof resolved.focus === "function") {{
+      resolved.focus();
+    }}
+  }} catch (_) {{
+    // Ignore focus issues and still attempt to set the value.
+  }}
+
+  setNativeValue(resolved, targetValue);
+  resolved.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  resolved.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+  if (window.jQuery) {{
+    try {{
+      window.jQuery(resolved).trigger("input");
+      window.jQuery(resolved).trigger("change");
+    }} catch (_) {{
+      // Ignore jQuery trigger issues and rely on native events.
+    }}
+  }}
+
+  return JSON.stringify({{
+    success: true,
+    resolved_index: candidates.indexOf(resolved),
+    matched_label: getLabelText(resolved) || null
+  }});
+}})()"""
+
+
+def _fill_via_eval(
+    task_id: str,
+    ref: str,
+    typed_text: str,
+    snapshot_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Fallback fill by targeting a visible editable control in the DOM."""
+    effective_snapshot = snapshot_result or _get_compact_snapshot(task_id)
+    dom_index = _resolve_editable_dom_index(ref, snapshot_result=effective_snapshot)
+    preferred_label = _resolve_snapshot_ref_text(
+        task_id,
+        ref,
+        snapshot_result=effective_snapshot,
+    )
+    script = _build_fill_eval_script(dom_index, typed_text, preferred_label=preferred_label)
+
+    result = _run_browser_command(task_id, "eval", [script])
+    if not result.get("success"):
+        return result
+
+    parsed_result = _parse_eval_result_dict(result.get("data", {}).get("result"))
+    if parsed_result and parsed_result.get("success"):
+        return {"success": True, "data": parsed_result}
+
+    return {
+        "success": False,
+        "error": (
+            (parsed_result or {}).get("error")
+            or result.get("error")
+            or "DOM fill fallback failed."
+        ),
+    }
+
+
+def _run_snapshot_capture(task_id: str, full: bool) -> Dict[str, Any]:
+    """Capture a single raw snapshot result."""
+    args: List[str] = []
+    if not full:
+        args.append("-c")
+    return _run_browser_command(task_id, "snapshot", args)
+
+
+def _score_snapshot_result(result: Dict[str, Any]) -> tuple[int, int]:
+    """Rank snapshot results by element count first, then raw snapshot length."""
+    if not result.get("success"):
+        return (-1, -1)
+
+    refs = _snapshot_refs(result)
+    snapshot_text = _snapshot_text(result)
+    return (len(refs), len(snapshot_text))
+
+
+def _build_snapshot_response(
+    result: Dict[str, Any],
+    user_task: Optional[str] = None,
+    *,
+    stabilize: bool = False,
+    attempt_count: int = 1,
+    selected_attempt: Optional[int] = 1,
+) -> str:
+    """Convert a raw snapshot command result into the public tool response."""
+    if result.get("success"):
+        data = result.get("data", {})
+        snapshot_text = data.get("snapshot", "")
+        refs = data.get("refs", {})
+
+        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
+            snapshot_text = _extract_relevant_content(snapshot_text, user_task)
+        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+            snapshot_text = _truncate_snapshot(snapshot_text)
+
+        response: Dict[str, Any] = {
+            "success": True,
+            "snapshot": snapshot_text,
+            "element_count": len(refs) if refs else 0,
+        }
+        if stabilize:
+            response.update(
+                {
+                    "stabilized": True,
+                    "attempt_count": attempt_count,
+                    "selected_attempt": selected_attempt,
+                }
+            )
+        return json.dumps(response, ensure_ascii=False)
+
+    response = {
+        "success": False,
+        "error": result.get("error", "Failed to get snapshot"),
+    }
+    if stabilize:
+        response.update(
+            {
+                "stabilized": True,
+                "attempt_count": attempt_count,
+                "selected_attempt": selected_attempt,
+            }
+        )
+    return json.dumps(response, ensure_ascii=False)
 
 
 def _parse_eval_result_dict(raw_result: Any) -> Optional[Dict[str, Any]]:
@@ -2048,7 +2333,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 def browser_snapshot(
     full: bool = False,
     task_id: Optional[str] = None,
-    user_task: Optional[str] = None
+    user_task: Optional[str] = None,
+    stabilize: bool = False,
 ) -> str:
     """
     Get a text-based snapshot of the current page's accessibility tree.
@@ -2057,42 +2343,52 @@ def browser_snapshot(
         full: If True, return complete snapshot. If False, return compact view.
         task_id: Task identifier for session isolation
         user_task: The user's current task (for task-aware extraction)
+        stabilize: If True, retry over a short window and return the richest
+                   successful snapshot
         
     Returns:
         JSON string with page snapshot
     """
     effective_task_id = task_id or "default"
-    
-    # Build command args based on full flag
-    args = []
-    if not full:
-        args.extend(["-c"])  # Compact mode
-    
-    result = _run_browser_command(effective_task_id, "snapshot", args)
-    
-    if result.get("success"):
-        data = result.get("data", {})
-        snapshot_text = data.get("snapshot", "")
-        refs = data.get("refs", {})
-        
-        # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
-            snapshot_text = _extract_relevant_content(snapshot_text, user_task)
-        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot_text = _truncate_snapshot(snapshot_text)
-        
-        response = {
-            "success": True,
-            "snapshot": snapshot_text,
-            "element_count": len(refs) if refs else 0
-        }
-        
-        return json.dumps(response, ensure_ascii=False)
-    else:
-        return json.dumps({
-            "success": False,
-            "error": result.get("error", "Failed to get snapshot")
-        }, ensure_ascii=False)
+
+    if not stabilize:
+        return _build_snapshot_response(
+            _run_snapshot_capture(effective_task_id, full),
+            user_task=user_task,
+        )
+
+    attempts: List[tuple[int, Dict[str, Any]]] = []
+    for attempt_index, delay_seconds in enumerate(SNAPSHOT_STABILIZE_DELAYS, start=1):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        attempts.append((attempt_index, _run_snapshot_capture(effective_task_id, full)))
+
+    best_success: Optional[tuple[int, Dict[str, Any], tuple[int, int]]] = None
+    for attempt_index, result in attempts:
+        if not result.get("success"):
+            continue
+        score = _score_snapshot_result(result)
+        if best_success is None or score > best_success[2]:
+            best_success = (attempt_index, result, score)
+
+    if best_success is not None:
+        selected_attempt, selected_result, _ = best_success
+        return _build_snapshot_response(
+            selected_result,
+            user_task=user_task,
+            stabilize=True,
+            attempt_count=len(attempts),
+            selected_attempt=selected_attempt,
+        )
+
+    last_result = attempts[-1][1]
+    return _build_snapshot_response(
+        last_result,
+        user_task=user_task,
+        stabilize=True,
+        attempt_count=len(attempts),
+        selected_attempt=None,
+    )
 
 
 def browser_click(ref: str, task_id: Optional[str] = None) -> str:
@@ -2404,15 +2700,31 @@ def browser_type(
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
-    
-    # Use fill command (clears then types)
-    result = _run_browser_command(effective_task_id, "fill", [ref, resolved_text or ""])
-    
+
+    typed_text = resolved_text or ""
+    result = _run_browser_command(effective_task_id, "fill", [ref, typed_text])
+    fallback_snapshot: Optional[Dict[str, Any]] = None
+    if not result.get("success") and (
+        _is_invalid_ref_or_selector_error(result.get("error"))
+        or _is_command_timeout_error(result.get("error"))
+    ):
+        retry_snapshot = _get_compact_snapshot(effective_task_id)
+        fallback_snapshot = retry_snapshot if retry_snapshot.get("success") else None
+        result = _run_browser_command(effective_task_id, "fill", [ref, typed_text])
+
+        if not result.get("success"):
+            result = _fill_via_eval(
+                effective_task_id,
+                ref,
+                typed_text,
+                snapshot_result=fallback_snapshot,
+            )
+
     if result.get("success"):
         response: Dict[str, Any] = {
             "success": True,
             "typed": True,
-            "typed_chars": len(resolved_text or ""),
+            "typed_chars": len(typed_text),
             "element": ref,
         }
         if secret_env_var:
@@ -3054,7 +3366,11 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
     handler=lambda args, **kw: browser_snapshot(
-        full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
+        full=args.get("full", False),
+        task_id=kw.get("task_id"),
+        user_task=kw.get("user_task"),
+        stabilize=args.get("stabilize", False),
+    ),
     check_fn=check_browser_requirements,
     emoji="📸",
 )
