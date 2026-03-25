@@ -299,9 +299,58 @@ def drive_search(args):
     print(json.dumps(files, indent=2, ensure_ascii=False))
 
 
+def parse_xlsx(file_path, max_rows=500):
+    """Parse Excel file to JSON."""
+    import openpyxl
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    sheets = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = []
+        headers = None
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i == 0:
+                headers = [str(c) if c is not None else "" for c in row]
+            elif i <= max_rows:
+                rows.append([str(c) if c is not None else "" for c in row])
+        sheets.append({"name": sheet_name, "headers": headers or [], "rows": rows, "row_count": len(rows)})
+    wb.close()
+    return json.dumps({"type": "spreadsheet", "sheets": sheets}, indent=2, ensure_ascii=False)
+
+
+def parse_docx(file_path):
+    """Parse Word document to text."""
+    import docx
+    doc = docx.Document(file_path)
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    return "\n".join(paragraphs)
+
+
+def parse_pdf(file_path):
+    """Parse PDF to text."""
+    import fitz  # pymupdf
+    doc = fitz.open(file_path)
+    pages = []
+    for page in doc:
+        text = page.get_text()
+        if text.strip():
+            pages.append(text)
+    doc.close()
+    return "\n\n--- Page Break ---\n\n".join(pages)
+
+
+BINARY_HANDLERS = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": (".xlsx", parse_xlsx),
+    "application/vnd.ms-excel": (".xls", parse_xlsx),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (".docx", parse_docx),
+    "application/pdf": (".pdf", parse_pdf),
+}
+
+
 def drive_get(args):
     """Download and print file content by ID. Handles Google Docs/Sheets export and binary files."""
     import io
+    import tempfile
     service = build_service("drive", "v3")
 
     # Get file metadata first
@@ -321,8 +370,11 @@ def drive_get(args):
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
         print(content)
-    else:
-        # Binary/text files: download content
+        return
+
+    # Binary formats with dedicated parsers
+    if mime in BINARY_HANDLERS:
+        ext, handler = BINARY_HANDLERS[mime]
         from googleapiclient.http import MediaIoBaseDownload
         request = service.files().get_media(fileId=args.file_id)
         buf = io.BytesIO()
@@ -330,12 +382,29 @@ def drive_get(args):
         done = False
         while not done:
             _, done = downloader.next_chunk()
-        raw = buf.getvalue()
-        # Try to decode as text
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(buf.getvalue())
+            tmp_path = tmp.name
         try:
-            print(raw.decode("utf-8"))
-        except UnicodeDecodeError:
-            print(f"[Binary file: {name} ({mime}, {len(raw)} bytes). Cannot display as text.]")
+            result = handler(tmp_path)
+            print(result)
+        finally:
+            os.unlink(tmp_path)
+        return
+
+    # Other binary/text files: download and try to decode as text
+    from googleapiclient.http import MediaIoBaseDownload
+    request = service.files().get_media(fileId=args.file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    raw = buf.getvalue()
+    try:
+        print(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        print(f"[Binary file: {name} ({mime}, {len(raw)} bytes). Cannot display as text.]")
 
 
 # =========================================================================
