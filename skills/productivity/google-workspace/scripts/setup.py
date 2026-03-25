@@ -12,6 +12,11 @@ Commands:
   setup.py --revoke                         # Revoke and delete stored token
   setup.py --install-deps                   # Install Python dependencies only
 
+Named tokens (for separate accounts):
+  setup.py --check --token-name gmail       # Check gmail-specific token
+  setup.py --auth-url --token-name gmail    # OAuth URL with Gmail-only scopes
+  setup.py --auth-code CODE --token-name gmail  # Save to google_gmail_token.json
+
 Agent workflow:
   1. Run --check. If exit 0, auth is good — skip setup.
   2. Ask user for client_secret.json path. Run --client-secret PATH.
@@ -43,6 +48,29 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents.readonly",
 ]
+
+# Scopes used when --token-name gmail is specified (separate Gmail account).
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+
+
+def _resolve_paths(token_name: str | None):
+    """Compute token and pending-auth paths based on --token-name.
+
+    Returns (token_path, pending_path, scopes).
+    """
+    if token_name:
+        token_path = HERMES_HOME / f"google_{token_name}_token.json"
+        pending_path = HERMES_HOME / f"google_{token_name}_oauth_pending.json"
+        scopes = GMAIL_SCOPES if token_name == "gmail" else SCOPES
+    else:
+        token_path = TOKEN_PATH
+        pending_path = PENDING_AUTH_PATH
+        scopes = SCOPES
+    return token_path, pending_path, scopes
 
 REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google-auth-httplib2"]
 
@@ -86,10 +114,13 @@ def _ensure_deps():
             sys.exit(1)
 
 
-def check_auth():
+def check_auth(token_path=None, scopes=None):
     """Check if stored credentials are valid. Prints status, exits 0 or 1."""
-    if not TOKEN_PATH.exists():
-        print(f"NOT_AUTHENTICATED: No token at {TOKEN_PATH}")
+    token_path = token_path or TOKEN_PATH
+    scopes = scopes or SCOPES
+
+    if not token_path.exists():
+        print(f"NOT_AUTHENTICATED: No token at {token_path}")
         return False
 
     _ensure_deps()
@@ -97,20 +128,20 @@ def check_auth():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
     except Exception as e:
         print(f"TOKEN_CORRUPT: {e}")
         return False
 
     if creds.valid:
-        print(f"AUTHENTICATED: Token valid at {TOKEN_PATH}")
+        print(f"AUTHENTICATED: Token valid at {token_path}")
         return True
 
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            TOKEN_PATH.write_text(creds.to_json())
-            print(f"AUTHENTICATED: Token refreshed at {TOKEN_PATH}")
+            token_path.write_text(creds.to_json())
+            print(f"AUTHENTICATED: Token refreshed at {token_path}")
             return True
         except Exception as e:
             print(f"REFRESH_FAILED: {e}")
@@ -142,9 +173,10 @@ def store_client_secret(path: str):
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
-def _save_pending_auth(*, state: str, code_verifier: str):
+def _save_pending_auth(*, state: str, code_verifier: str, pending_path=None):
     """Persist the OAuth session bits needed for a later token exchange."""
-    PENDING_AUTH_PATH.write_text(
+    path = pending_path or PENDING_AUTH_PATH
+    path.write_text(
         json.dumps(
             {
                 "state": state,
@@ -156,14 +188,15 @@ def _save_pending_auth(*, state: str, code_verifier: str):
     )
 
 
-def _load_pending_auth() -> dict:
+def _load_pending_auth(pending_path=None) -> dict:
     """Load the pending OAuth session created by get_auth_url()."""
-    if not PENDING_AUTH_PATH.exists():
+    path = pending_path or PENDING_AUTH_PATH
+    if not path.exists():
         print("ERROR: No pending OAuth session found. Run --auth-url first.")
         sys.exit(1)
 
     try:
-        data = json.loads(PENDING_AUTH_PATH.read_text())
+        data = json.loads(path.read_text())
     except Exception as e:
         print(f"ERROR: Could not read pending OAuth session: {e}")
         print("Run --auth-url again to start a fresh OAuth session.")
@@ -194,8 +227,11 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
     return params["code"][0], state
 
 
-def get_auth_url():
+def get_auth_url(pending_path=None, scopes=None):
     """Print the OAuth authorization URL. User visits this in a browser."""
+    pending_path = pending_path or PENDING_AUTH_PATH
+    scopes = scopes or SCOPES
+
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
         sys.exit(1)
@@ -205,7 +241,7 @@ def get_auth_url():
 
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=scopes,
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
@@ -213,18 +249,22 @@ def get_auth_url():
         access_type="offline",
         prompt="consent",
     )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
+    _save_pending_auth(state=state, code_verifier=flow.code_verifier, pending_path=pending_path)
     # Print just the URL so the agent can extract it cleanly
     print(auth_url)
 
 
-def exchange_auth_code(code: str):
+def exchange_auth_code(code: str, token_path=None, pending_path=None, scopes=None):
     """Exchange the authorization code for a token and save it."""
+    token_path = token_path or TOKEN_PATH
+    pending_path = pending_path or PENDING_AUTH_PATH
+    scopes = scopes or SCOPES
+
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
         sys.exit(1)
 
-    pending_auth = _load_pending_auth()
+    pending_auth = _load_pending_auth(pending_path)
     code, returned_state = _extract_code_and_state(code)
     if returned_state and returned_state != pending_auth["state"]:
         print("ERROR: OAuth state mismatch. Run --auth-url again to start a fresh session.")
@@ -235,7 +275,7 @@ def exchange_auth_code(code: str):
 
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=scopes,
         redirect_uri=pending_auth.get("redirect_uri", REDIRECT_URI),
         state=pending_auth["state"],
         code_verifier=pending_auth["code_verifier"],
@@ -249,14 +289,18 @@ def exchange_auth_code(code: str):
         sys.exit(1)
 
     creds = flow.credentials
-    TOKEN_PATH.write_text(creds.to_json())
-    PENDING_AUTH_PATH.unlink(missing_ok=True)
-    print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
+    token_path.write_text(creds.to_json())
+    pending_path.unlink(missing_ok=True)
+    print(f"OK: Authenticated. Token saved to {token_path}")
 
 
-def revoke():
+def revoke(token_path=None, pending_path=None, scopes=None):
     """Revoke stored token and delete it."""
-    if not TOKEN_PATH.exists():
+    token_path = token_path or TOKEN_PATH
+    pending_path = pending_path or PENDING_AUTH_PATH
+    scopes = scopes or SCOPES
+
+    if not token_path.exists():
         print("No token to revoke.")
         return
 
@@ -265,7 +309,7 @@ def revoke():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
 
@@ -281,13 +325,17 @@ def revoke():
     except Exception as e:
         print(f"Remote revocation failed (token may already be invalid): {e}")
 
-    TOKEN_PATH.unlink(missing_ok=True)
-    PENDING_AUTH_PATH.unlink(missing_ok=True)
-    print(f"Deleted {TOKEN_PATH}")
+    token_path.unlink(missing_ok=True)
+    pending_path.unlink(missing_ok=True)
+    print(f"Deleted {token_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
+    parser.add_argument(
+        "--token-name", metavar="NAME", default=None,
+        help="Use a named token file (e.g. --token-name gmail -> google_gmail_token.json)",
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
     group.add_argument("--client-secret", metavar="PATH", help="Store OAuth client_secret.json")
@@ -297,16 +345,18 @@ def main():
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
     args = parser.parse_args()
 
+    token_path, pending_path, scopes = _resolve_paths(args.token_name)
+
     if args.check:
-        sys.exit(0 if check_auth() else 1)
+        sys.exit(0 if check_auth(token_path, scopes) else 1)
     elif args.client_secret:
         store_client_secret(args.client_secret)
     elif args.auth_url:
-        get_auth_url()
+        get_auth_url(pending_path, scopes)
     elif args.auth_code:
-        exchange_auth_code(args.auth_code)
+        exchange_auth_code(args.auth_code, token_path, pending_path, scopes)
     elif args.revoke:
-        revoke()
+        revoke(token_path, pending_path, scopes)
     elif args.install_deps:
         sys.exit(0 if install_deps() else 1)
 

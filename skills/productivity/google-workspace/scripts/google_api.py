@@ -30,6 +30,7 @@ from pathlib import Path
 
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 TOKEN_PATH = HERMES_HOME / "google_token.json"
+GMAIL_TOKEN_PATH = HERMES_HOME / "google_gmail_token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -43,29 +44,45 @@ SCOPES = [
 ]
 
 
-def get_credentials():
-    """Load and refresh credentials from token file."""
-    if not TOKEN_PATH.exists():
-        print("Not authenticated. Run the setup script first:", file=sys.stderr)
-        print(f"  python {Path(__file__).parent / 'setup.py'}", file=sys.stderr)
+def get_credentials(token_path=None):
+    """Load and refresh credentials from token file.
+
+    Args:
+        token_path: Path to the token JSON file.  Defaults to TOKEN_PATH
+                    (google_token.json).  Pass GMAIL_TOKEN_PATH for Gmail.
+    """
+    path = token_path or TOKEN_PATH
+    if not path.exists():
+        print(f"Not authenticated ({path.name}). Run the setup script first:", file=sys.stderr)
+        if path == GMAIL_TOKEN_PATH:
+            print(f"  python {Path(__file__).parent / 'setup.py'} --auth-url --token-name gmail", file=sys.stderr)
+        else:
+            print(f"  python {Path(__file__).parent / 'setup.py'}", file=sys.stderr)
         sys.exit(1)
 
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    creds = Credentials.from_authorized_user_file(str(path))
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(creds.to_json())
+        path.write_text(creds.to_json())
     if not creds.valid:
-        print("Token is invalid. Re-run setup.", file=sys.stderr)
+        print(f"Token is invalid ({path.name}). Re-run setup.", file=sys.stderr)
         sys.exit(1)
     return creds
 
 
-def build_service(api, version):
+def build_service(api, version, token_path=None):
+    """Build a Google API service client.
+
+    Args:
+        api: API name (e.g. "gmail", "drive").
+        version: API version (e.g. "v1", "v3").
+        token_path: Optional path to the token file.  Defaults to TOKEN_PATH.
+    """
     from googleapiclient.discovery import build
-    return build(api, version, credentials=get_credentials())
+    return build(api, version, credentials=get_credentials(token_path))
 
 
 # =========================================================================
@@ -73,7 +90,7 @@ def build_service(api, version):
 # =========================================================================
 
 def gmail_search(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     results = service.users().messages().list(
         userId="me", q=args.query, maxResults=args.max
     ).execute()
@@ -103,7 +120,7 @@ def gmail_search(args):
 
 
 def gmail_get(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     msg = service.users().messages().get(
         userId="me", id=args.message_id, format="full"
     ).execute()
@@ -140,7 +157,7 @@ def gmail_get(args):
 
 
 def gmail_send(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     message = MIMEText(args.body, "html" if args.html else "plain")
     message["to"] = args.to
     message["subject"] = args.subject
@@ -158,7 +175,7 @@ def gmail_send(args):
 
 
 def gmail_reply(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     # Fetch original to get thread ID and headers
     original = service.users().messages().get(
         userId="me", id=args.message_id, format="metadata",
@@ -185,14 +202,14 @@ def gmail_reply(args):
 
 
 def gmail_labels(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     results = service.users().labels().list(userId="me").execute()
     labels = [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in results.get("labels", [])]
     print(json.dumps(labels, indent=2))
 
 
 def gmail_modify(args):
-    service = build_service("gmail", "v1")
+    service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
     body = {}
     if args.add_labels:
         body["addLabelIds"] = args.add_labels.split(",")
@@ -273,11 +290,52 @@ def calendar_delete(args):
 def drive_search(args):
     service = build_service("drive", "v3")
     query = f"fullText contains '{args.query}'" if not args.raw_query else args.query
+    if hasattr(args, 'parent') and args.parent:
+        query += f" and '{args.parent}' in parents"
     results = service.files().list(
         q=query, pageSize=args.max, fields="files(id, name, mimeType, modifiedTime, webViewLink)",
     ).execute()
     files = results.get("files", [])
     print(json.dumps(files, indent=2, ensure_ascii=False))
+
+
+def drive_get(args):
+    """Download and print file content by ID. Handles Google Docs/Sheets export and binary files."""
+    import io
+    service = build_service("drive", "v3")
+
+    # Get file metadata first
+    meta = service.files().get(fileId=args.file_id, fields="name,mimeType").execute()
+    mime = meta.get("mimeType", "")
+    name = meta.get("name", "unknown")
+
+    # Google native formats: export as plain text
+    export_map = {
+        "application/vnd.google-apps.document": "text/plain",
+        "application/vnd.google-apps.spreadsheet": "text/csv",
+        "application/vnd.google-apps.presentation": "text/plain",
+    }
+
+    if mime in export_map:
+        content = service.files().export(fileId=args.file_id, mimeType=export_map[mime]).execute()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        print(content)
+    else:
+        # Binary/text files: download content
+        from googleapiclient.http import MediaIoBaseDownload
+        request = service.files().get_media(fileId=args.file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        raw = buf.getvalue()
+        # Try to decode as text
+        try:
+            print(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            print(f"[Binary file: {name} ({mime}, {len(raw)} bytes). Cannot display as text.]")
 
 
 # =========================================================================
@@ -439,7 +497,12 @@ def main():
     p.add_argument("query")
     p.add_argument("--max", type=int, default=10)
     p.add_argument("--raw-query", action="store_true", help="Use query as raw Drive API query")
+    p.add_argument("--parent", help="Filter by parent folder ID")
     p.set_defaults(func=drive_search)
+
+    p = drv_sub.add_parser("get")
+    p.add_argument("file_id", help="Google Drive file ID")
+    p.set_defaults(func=drive_get)
 
     # --- Contacts ---
     con = sub.add_parser("contacts")
