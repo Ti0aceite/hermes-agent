@@ -97,7 +97,11 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import (
+    redact_sensitive_text,
+    redact_persisted_text,
+    redact_clinical_field_value,
+)
 from utils import atomic_json_write
 
 HONCHO_TOOL_NAMES = {
@@ -110,18 +114,21 @@ HONCHO_TOOL_NAMES = {
 
 def _sanitize_tool_arguments_for_persistence(tool_name: str, arguments: Any) -> Any:
     """Return a persistence-safe copy of sensitive tool arguments."""
-    if tool_name != "browser_type" or not isinstance(arguments, dict):
+    if not isinstance(arguments, dict):
         return arguments
 
-    sanitized: Dict[str, Any] = {}
-    if "ref" in arguments:
-        sanitized["ref"] = arguments["ref"]
-    if arguments.get("secret_env_var"):
-        sanitized["secret_env_var"] = arguments["secret_env_var"]
-    if "text" in arguments:
-        sanitized["text_redacted"] = True
-        sanitized["typed_chars"] = len(str(arguments.get("text") or ""))
-    return sanitized
+    if tool_name == "browser_type":
+        sanitized: Dict[str, Any] = {}
+        if "ref" in arguments:
+            sanitized["ref"] = arguments["ref"]
+        if arguments.get("secret_env_var"):
+            sanitized["secret_env_var"] = arguments["secret_env_var"]
+        if "text" in arguments:
+            sanitized["text_redacted"] = True
+            sanitized["typed_chars"] = len(str(arguments.get("text") or ""))
+        return _sanitize_structured_value_for_persistence(sanitized)
+
+    return _sanitize_structured_value_for_persistence(arguments)
 
 
 def _sanitize_tool_argument_string_for_persistence(tool_name: str, raw_arguments: Any) -> Any:
@@ -131,13 +138,36 @@ def _sanitize_tool_argument_string_for_persistence(tool_name: str, raw_arguments
     try:
         parsed = json.loads(raw_arguments)
     except Exception:
-        return raw_arguments
-    if not isinstance(parsed, dict):
-        return raw_arguments
+        return redact_persisted_text(raw_arguments)
     sanitized = _sanitize_tool_arguments_for_persistence(tool_name, parsed)
-    if sanitized is parsed:
-        return raw_arguments
     return json.dumps(sanitized, ensure_ascii=False)
+
+
+def _sanitize_structured_value_for_persistence(value: Any, field_name: Optional[str] = None) -> Any:
+    """Recursively sanitize structured values before writing persisted artifacts."""
+    if isinstance(value, list):
+        return [_sanitize_structured_value_for_persistence(item) for item in value]
+
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "arguments" and isinstance(value.get("name"), str):
+                sanitized[key] = item
+                continue
+            if key == "content" and value.get("role") == "tool":
+                sanitized[key] = item
+                continue
+            sanitized[key] = _sanitize_structured_value_for_persistence(item, field_name=key)
+        return sanitized
+
+    if isinstance(value, str):
+        if field_name:
+            field_redacted = redact_clinical_field_value(field_name, value)
+            if field_redacted != value:
+                return field_redacted
+        return redact_persisted_text(value)
+
+    return value
 
 
 def _sanitize_tool_output_for_persistence(raw_content: Any) -> Any:
@@ -147,37 +177,35 @@ def _sanitize_tool_output_for_persistence(raw_content: Any) -> Any:
     try:
         parsed = json.loads(raw_content)
     except Exception:
-        return raw_content
+        return redact_persisted_text(raw_content)
     sanitized = _sanitize_tool_output_payload(parsed)
-    if sanitized is parsed:
-        return raw_content
     return json.dumps(sanitized, ensure_ascii=False)
 
 
 def _sanitize_tool_output_payload(value: Any) -> Any:
     """Recursively sanitize snapshot-like fields inside tool output payloads."""
-    if isinstance(value, list):
-        return [_sanitize_tool_output_payload(item) for item in value]
-
-    if isinstance(value, dict):
-        sanitized: Dict[str, Any] = {}
-        for key, item in value.items():
-            if key in {"snapshot", "page_text", "html"} and isinstance(item, str):
-                sanitized[key] = redact_sensitive_text(item)
-            else:
-                sanitized[key] = _sanitize_tool_output_payload(item)
-        return sanitized
-
-    return value
+    return _sanitize_structured_value_for_persistence(value)
 
 
 def _sanitize_persisted_payload(value: Any) -> Any:
     """Recursively sanitize payloads before persisting them to disk."""
+    if isinstance(value, str):
+        return redact_persisted_text(value)
+
     if isinstance(value, list):
         return [_sanitize_persisted_payload(item) for item in value]
 
     if isinstance(value, dict):
-        sanitized = {key: _sanitize_persisted_payload(item) for key, item in value.items()}
+        sanitized = {}
+        for key, item in value.items():
+            if key == "arguments" and isinstance(value.get("name"), str):
+                sanitized[key] = item
+                continue
+            if key == "content" and value.get("role") == "tool":
+                sanitized[key] = item
+                continue
+            cleaned = _sanitize_persisted_payload(item)
+            sanitized[key] = _sanitize_structured_value_for_persistence(cleaned, field_name=key)
 
         function = sanitized.get("function")
         if isinstance(function, dict):
@@ -199,7 +227,7 @@ def _sanitize_persisted_payload(value: Any) -> Any:
             )
 
         if sanitized.get("role") == "system" and isinstance(sanitized.get("content"), str):
-            sanitized["content"] = redact_sensitive_text(sanitized["content"])
+            sanitized["content"] = redact_persisted_text(sanitized["content"])
 
         return sanitized
 
@@ -1971,7 +1999,7 @@ class AIAgent:
                 "platform": self.platform,
                 "session_start": self.session_start.isoformat(),
                 "last_updated": datetime.now().isoformat(),
-                "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
+                "system_prompt": redact_persisted_text(self._cached_system_prompt or ""),
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
                 "messages": cleaned,

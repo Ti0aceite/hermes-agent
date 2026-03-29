@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from agent.redact import redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    redact_sensitive_text,
+    redact_persisted_text,
+    redact_clinical_field_value,
+    RedactingFormatter,
+)
 
 
 class TestKnownPrefixes:
@@ -187,3 +192,47 @@ class TestSecretCapturePayloadRedaction:
         text = '{"raw_secret": "ghp_abc123def456ghi789jkl"}'
         result = redact_sensitive_text(text)
         assert "abc123def456" not in result
+
+
+class TestPersistedClinicalRedaction:
+    def test_redacts_chilean_rut_and_phone_labels(self):
+        text = "Rut: 18.736.288-1\nCelular: 930154445"
+        result = redact_persisted_text(text)
+        assert "18.736.288-1" not in result
+        assert "930154445" not in result
+        assert "[REDACTED RUT]" in result
+        assert "[REDACTED PHONE]" in result
+
+    def test_redacts_dentidesk_patient_detail_line(self):
+        text = "- Silvia Aguero Soto, Dr. Cornelio Medina, celular 930154445"
+        result = redact_persisted_text(text)
+        assert "Silvia Aguero Soto" not in result
+        assert "930154445" not in result
+        assert result == "- [REDACTED PATIENT DETAIL]"
+
+    def test_redacts_inline_patient_label(self):
+        text = "Último paciente: Silvia Aguero Soto, Rut: 18.736.288-1"
+        result = redact_persisted_text(text)
+        assert "Silvia Aguero Soto" not in result
+        assert "18.736.288-1" not in result
+        assert "paciente: [REDACTED PATIENT]" in result
+
+    def test_does_not_redact_generic_patient_noun_without_label(self):
+        text = "El formato debe listar paciente, fecha y hora."
+        result = redact_persisted_text(text)
+        assert result == text
+
+    def test_redacts_embedded_json_clinical_fields(self):
+        text = '{"Nombre Paciente": "Silvia Aguero Soto", "Rut": "18.736.288-1", "Teléfono Celular": "930154445"}'
+        result = redact_persisted_text(text)
+        assert "Silvia Aguero Soto" not in result
+        assert "18.736.288-1" not in result
+        assert "930154445" not in result
+        assert '"Nombre Paciente": "[REDACTED PATIENT]"' in result
+        assert '"Rut": "[REDACTED RUT]"' in result
+        assert '"Teléfono Celular": "[REDACTED PHONE]"' in result
+
+    def test_redacts_clinical_field_values_by_key(self):
+        assert redact_clinical_field_value("paciente", "Silvia Aguero Soto") == "[REDACTED PATIENT]"
+        assert redact_clinical_field_value("rut", "18.736.288-1") == "[REDACTED RUT]"
+        assert redact_clinical_field_value("celular", "930154445") == "[REDACTED PHONE]"

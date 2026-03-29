@@ -2299,6 +2299,102 @@ class TestSaveSessionLogAtomicWrite:
         saved_content = json.loads(payload["messages"][0]["content"])
         assert saved_content["snapshot"] == '- link "***" [ref=e3]\n- link "Reportes" [ref=e7]'
 
+    def test_redacts_assistant_clinical_detail_lines_in_session_log(self, agent, tmp_path):
+        agent.session_log_file = tmp_path / "session.json"
+        messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Aquí tienes el reporte:\n"
+                    "- Silvia Aguero Soto, Dr. Cornelio Medina, celular 930154445\n"
+                    "- Camila Lillo Aguero, Dra. Carolina Villa, celular 984337534\n"
+                    "Total de pacientes: 2"
+                ),
+            }
+        ]
+
+        with patch("run_agent.atomic_json_write", create=True) as mock_atomic_write:
+            agent._save_session_log(messages)
+
+        payload = mock_atomic_write.call_args.args[1]
+        saved_content = payload["messages"][0]["content"]
+        assert "Silvia Aguero Soto" not in saved_content
+        assert "Camila Lillo Aguero" not in saved_content
+        assert "930154445" not in saved_content
+        assert "984337534" not in saved_content
+        assert "- [REDACTED PATIENT DETAIL]" in saved_content
+        assert "Total de pacientes: 2" in saved_content
+
+    def test_redacts_structured_clinical_tool_output_fields(self, agent, tmp_path):
+        agent.session_log_file = tmp_path / "session.json"
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "detail": [
+                            {
+                                "paciente": "Silvia Aguero Soto",
+                                "rut": "18.736.288-1",
+                                "celular": "930154445",
+                                "doctor": "Dr. Cornelio Medina",
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+
+        with patch("run_agent.atomic_json_write", create=True) as mock_atomic_write:
+            agent._save_session_log(messages)
+
+        payload = mock_atomic_write.call_args.args[1]
+        saved_content = json.loads(payload["messages"][0]["content"])
+        saved_detail = saved_content["detail"][0]
+        assert saved_detail["paciente"] == "[REDACTED PATIENT]"
+        assert saved_detail["rut"] == "[REDACTED RUT]"
+        assert saved_detail["celular"] == "[REDACTED PHONE]"
+        assert saved_detail["doctor"] == "Dr. Cornelio Medina"
+
+    def test_redacts_clinical_details_in_memory_tool_arguments(self, agent, tmp_path):
+        agent.session_log_file = tmp_path / "session.json"
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "memory",
+                            "arguments": json.dumps(
+                                {
+                                    "action": "add",
+                                    "target": "memory",
+                                    "content": (
+                                        "Último paciente: Silvia Aguero Soto, "
+                                        "Rut: 18.736.288-1, celular 930154445"
+                                    ),
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+
+        with patch("run_agent.atomic_json_write", create=True) as mock_atomic_write:
+            agent._save_session_log(messages)
+
+        payload = mock_atomic_write.call_args.args[1]
+        saved_args = json.loads(payload["messages"][0]["tool_calls"][0]["function"]["arguments"])
+        assert "Silvia Aguero Soto" not in saved_args["content"]
+        assert "18.736.288-1" not in saved_args["content"]
+        assert "930154445" not in saved_args["content"]
+        assert "[REDACTED RUT]" in saved_args["content"]
+        assert "[REDACTED PHONE]" in saved_args["content"]
+
 
 # ===================================================================
 # Anthropic adapter integration fixes

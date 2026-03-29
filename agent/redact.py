@@ -10,6 +10,7 @@ the first 6 and last 4 characters for debuggability.
 import logging
 import os
 import re
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,55 @@ _SCOPED_LOGIN_ENV_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Chilean RUT values commonly appear in Dentidesk responses.
+_CHILEAN_RUT_RE = re.compile(
+    r"\b(?:\d{1,2}(?:\.\d{3}){2}|\d{7,8})-[\dkK]\b"
+)
+
+# Local mobile/phone values as they appear in patient detail rows.
+_LOCAL_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?56\s*)?(?:9\s*)?\d{8}(?!\d)"
+)
+
+_CLINICAL_PHONE_LABEL_RE = re.compile(
+    r"\b(?:celular|tel[eé]fono(?:\s+(?:celular|fijo))?|fono|m[oó]vil)\b",
+    re.IGNORECASE,
+)
+
+_LABELED_PHONE_RE = re.compile(
+    r"(?i)\b(celular|tel[eé]fono(?:\s+(?:celular|fijo))?|fono|m[oó]vil)\b(\s*:?\s*)(?:\+?56\s*)?(?:9\s*)?\d{8}(?!\d)"
+)
+
+_PATIENT_LABEL_RE = re.compile(
+    r"(?i)(?<![\"'])\b(nombre(?:\s+del)?\s+paciente|paciente)\b(\s*:\s*)([^,\n]+)"
+)
+
+_JSON_CLINICAL_FIELD_RE = re.compile(
+    r'("(?P<key>Nombre(?:\s+del)?\s+Paciente|Paciente|Rut|RUT|Tel[eé]fono(?:\s+(?:Celular|Fijo))?|Celular|Fono|Observaciones)")(\s*:\s*)"(?P<value>[^"]*)"'
+)
+
+_PATIENT_LINE_PREFIX_RE = re.compile(r"^(\s*(?:[-*]|\d+\.)\s+)")
+_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+_CLINICAL_FIELD_PLACEHOLDERS = {
+    "paciente": "[REDACTED PATIENT]",
+    "nombrepaciente": "[REDACTED PATIENT]",
+    "nombre": "[REDACTED NAME]",
+    "rut": "[REDACTED RUT]",
+    "celular": "[REDACTED PHONE]",
+    "telefono": "[REDACTED PHONE]",
+    "telefonocelular": "[REDACTED PHONE]",
+    "telefonofijo": "[REDACTED PHONE]",
+    "fono": "[REDACTED PHONE]",
+    "movil": "[REDACTED PHONE]",
+    "observacion": "[REDACTED CLINICAL NOTE]",
+    "observaciones": "[REDACTED CLINICAL NOTE]",
+    "comentario": "[REDACTED CLINICAL NOTE]",
+    "comentarios": "[REDACTED CLINICAL NOTE]",
+    "nota": "[REDACTED CLINICAL NOTE]",
+    "notas": "[REDACTED CLINICAL NOTE]",
+}
+
 # Compile known prefix patterns into one alternation
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
@@ -106,6 +156,79 @@ def _mask_token(token: str) -> str:
     if len(token) < 18:
         return "***"
     return f"{token[:6]}...{token[-4:]}"
+
+
+def _normalize_clinical_field_name(field_name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", field_name)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", normalized.lower())
+
+
+def clinical_field_placeholder(field_name: str) -> str | None:
+    if not field_name:
+        return None
+    return _CLINICAL_FIELD_PLACEHOLDERS.get(_normalize_clinical_field_name(field_name))
+
+
+def redact_clinical_field_value(field_name: str, value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    placeholder = clinical_field_placeholder(field_name)
+    if not placeholder or not value.strip():
+        return value
+    return placeholder
+
+
+def _looks_like_patient_detail_line(line: str) -> bool:
+    if not line:
+        return False
+    if not _PATIENT_LINE_PREFIX_RE.match(line):
+        return False
+    if _CHILEAN_RUT_RE.search(line):
+        return True
+    if _LABELED_PHONE_RE.search(line):
+        return True
+    return bool(_TIME_RE.search(line) and _LOCAL_PHONE_RE.search(line))
+
+
+def redact_persisted_text(text: str) -> str:
+    """Apply secret redaction plus clinical PII scrubbing for persisted artifacts."""
+    if not text:
+        return text
+
+    text = redact_sensitive_text(text)
+    sanitized_lines = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        newline = line[len(stripped):]
+
+        if _looks_like_patient_detail_line(stripped):
+            prefix = _PATIENT_LINE_PREFIX_RE.match(stripped).group(1)
+            sanitized_lines.append(f"{prefix}[REDACTED PATIENT DETAIL]{newline}")
+            continue
+
+        stripped = _PATIENT_LABEL_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED PATIENT]",
+            stripped,
+        )
+        stripped = _JSON_CLINICAL_FIELD_RE.sub(
+            lambda m: (
+                f'{m.group(1)}{m.group(3)}"'
+                f'{clinical_field_placeholder(m.group("key")) or "[REDACTED CLINICAL FIELD]"}"'
+            ),
+            stripped,
+        )
+        stripped = _CHILEAN_RUT_RE.sub("[REDACTED RUT]", stripped)
+        stripped = _LABELED_PHONE_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED PHONE]",
+            stripped,
+        )
+        if _CLINICAL_PHONE_LABEL_RE.search(stripped):
+            stripped = _LOCAL_PHONE_RE.sub("[REDACTED PHONE]", stripped)
+
+        sanitized_lines.append(stripped + newline)
+
+    return "".join(sanitized_lines)
 
 
 def redact_sensitive_text(text: str) -> str:
