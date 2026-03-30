@@ -13,8 +13,10 @@ Tests cover:
 """
 
 import json
+import sys
 import time
 import uuid
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -135,6 +137,38 @@ class TestAdapterInit:
         assert adapter._host == "10.0.0.1"
         assert adapter._port == 7777
         assert adapter._api_key == "sk-env"
+
+
+class TestAgentCreation:
+    def test_create_agent_passes_enabled_toolsets(self, adapter):
+        fake_agent = MagicMock()
+        fake_run_agent = ModuleType("run_agent")
+        fake_run_agent.AIAgent = MagicMock(return_value=fake_agent)
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._resolve_runtime_agent_kwargs = MagicMock(return_value={})
+        fake_gateway_run._resolve_gateway_model = MagicMock(return_value="test-model")
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "run_agent": fake_run_agent,
+                    "gateway.run": fake_gateway_run,
+                },
+            ),
+        ):
+            created = adapter._create_agent(
+                ephemeral_system_prompt="system",
+                session_id="sess-123",
+                enabled_toolsets=["skills", "terminal"],
+            )
+
+        assert created is fake_agent
+        kwargs = fake_run_agent.AIAgent.call_args.kwargs
+        assert kwargs["platform"] == "api_server"
+        assert kwargs["ephemeral_system_prompt"] == "system"
+        assert kwargs["session_id"] == "sess-123"
+        assert kwargs["enabled_toolsets"] == ["skills", "terminal"]
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +881,81 @@ class TestSendMethod:
         result = await adapter.send("chat1", "hello")
         assert result.success is False
         assert "HTTP request/response" in result.error
+
+
+class TestRunAgent:
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_api_server_toolsets_to_agent(self, adapter):
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "OK",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 12
+        fake_agent.session_completion_tokens = 8
+        fake_agent.session_total_tokens = 20
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._compose_auto_preload_ephemeral = MagicMock(
+            return_value=("base prompt\n\nauto skill prompt", ["dentidesk"], [])
+        )
+        fake_gateway_run._resolve_platform_enabled_toolsets = MagicMock(
+            return_value=["skills", "terminal"]
+        )
+
+        with (
+            patch.dict(sys.modules, {"gateway.run": fake_gateway_run}),
+            patch.object(adapter, "_create_agent", return_value=fake_agent) as mock_create,
+        ):
+            result, usage = await adapter._run_agent(
+                user_message="noshow de ayer",
+                conversation_history=[],
+                ephemeral_system_prompt="base prompt",
+                session_id="sess-123",
+            )
+
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["skills", "terminal"]
+        assert kwargs["ephemeral_system_prompt"] == "base prompt\n\nauto skill prompt"
+        assert kwargs["session_id"] == "sess-123"
+        assert result["final_response"] == "OK"
+        assert usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+
+    @pytest.mark.asyncio
+    async def test_run_agent_logs_missing_auto_preloaded_skills_without_failing(self, adapter):
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "OK",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._compose_auto_preload_ephemeral = MagicMock(
+            return_value=("base prompt", [], ["dentidesk"])
+        )
+        fake_gateway_run._resolve_platform_enabled_toolsets = MagicMock(
+            return_value=["skills"]
+        )
+
+        with (
+            patch.dict(sys.modules, {"gateway.run": fake_gateway_run}),
+            patch.object(adapter, "_create_agent", return_value=fake_agent),
+            patch("gateway.platforms.api_server.logger") as mock_logger,
+        ):
+            result, usage = await adapter._run_agent(
+                user_message="noshow de ayer",
+                conversation_history=[],
+                ephemeral_system_prompt="base prompt",
+                session_id="sess-456",
+            )
+
+        mock_logger.warning.assert_called_once()
+        assert "Auto-preloaded skill(s) not found for api_server" in mock_logger.warning.call_args[0][0]
+        assert result["final_response"] == "OK"
+        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 # ---------------------------------------------------------------------------

@@ -169,6 +169,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        enabled_toolsets: Optional[List[str]] = None,
         stream_delta_callback=None,
     ) -> Any:
         """
@@ -191,6 +192,7 @@ class APIServerAdapter(BasePlatformAdapter):
             max_iterations=max_iterations,
             quiet_mode=True,
             verbose_logging=False,
+            enabled_toolsets=enabled_toolsets,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             session_id=session_id,
             platform="api_server",
@@ -703,9 +705,32 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_event_loop()
 
         def _run():
+            from gateway.run import (
+                _compose_auto_preload_ephemeral,
+                _resolve_platform_enabled_toolsets,
+            )
+
+            combined_ephemeral, auto_loaded, auto_missing = _compose_auto_preload_ephemeral(
+                ephemeral_system_prompt,
+                "api_server",
+                user_message,
+                task_id=session_id,
+            )
+            if auto_missing:
+                logger.warning(
+                    "Auto-preloaded skill(s) not found for api_server: %s",
+                    ", ".join(auto_missing),
+                )
+            if auto_loaded:
+                logger.info(
+                    "Auto-preloaded skills for api_server: %s",
+                    ", ".join(auto_loaded),
+                )
+
             agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
+                ephemeral_system_prompt=combined_ephemeral,
                 session_id=session_id,
+                enabled_toolsets=_resolve_platform_enabled_toolsets("api_server"),
                 stream_delta_callback=stream_delta_callback,
             )
             result = agent.run_conversation(

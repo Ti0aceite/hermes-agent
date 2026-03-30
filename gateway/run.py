@@ -230,6 +230,107 @@ logger = logging.getLogger(__name__)
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+_PLATFORM_CONFIG_KEY_MAP = {
+    Platform.LOCAL: "cli",
+    Platform.TELEGRAM: "telegram",
+    Platform.DISCORD: "discord",
+    Platform.WHATSAPP: "whatsapp",
+    Platform.SLACK: "slack",
+    Platform.SIGNAL: "signal",
+    Platform.HOMEASSISTANT: "homeassistant",
+    Platform.EMAIL: "email",
+    Platform.DINGTALK: "dingtalk",
+    Platform.API_SERVER: "api_server",
+    Platform.WEBHOOK: "webhook",
+}
+
+_DEFAULT_TOOLSET_BY_PLATFORM_KEY = {
+    "cli": "hermes-cli",
+    "telegram": "hermes-telegram",
+    "discord": "hermes-discord",
+    "whatsapp": "hermes-whatsapp",
+    "slack": "hermes-slack",
+    "signal": "hermes-signal",
+    "homeassistant": "hermes-homeassistant",
+    "email": "hermes-email",
+    "dingtalk": "hermes-dingtalk",
+    # The API server is an interactive local surface, so default to the
+    # CLI preset unless the user overrides it in config.yaml.
+    "api_server": "hermes-cli",
+}
+
+
+def _load_gateway_user_config() -> dict[str, Any]:
+    """Best-effort load of ~/.hermes/config.yaml for gateway-side helpers."""
+    try:
+        config_path = _hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml as _yaml
+
+            with open(config_path, encoding="utf-8") as f:
+                loaded = _yaml.safe_load(f) or {}
+            if isinstance(loaded, dict):
+                return loaded
+    except Exception as exc:
+        logger.debug("Could not load gateway user config: %s", exc)
+    return {}
+
+
+def _resolve_platform_config_key(platform: Platform | str | None) -> str:
+    """Map platform enum/string values to config.yaml platform_toolsets keys."""
+    if isinstance(platform, Platform):
+        return _PLATFORM_CONFIG_KEY_MAP.get(platform, platform.value)
+
+    normalized = (platform or "").strip().lower()
+    if not normalized:
+        return "telegram"
+    if normalized == "local":
+        return "cli"
+    return normalized
+
+
+def _resolve_platform_enabled_toolsets(platform_key: str) -> list[str]:
+    """Resolve enabled toolsets for a platform key from config.yaml defaults."""
+    normalized_key = _resolve_platform_config_key(platform_key)
+    user_config = _load_gateway_user_config()
+    platform_toolsets = user_config.get("platform_toolsets", {})
+    if isinstance(platform_toolsets, dict):
+        configured = platform_toolsets.get(normalized_key)
+        if configured and isinstance(configured, list):
+            return [str(item) for item in configured if item]
+
+    default_toolset = _DEFAULT_TOOLSET_BY_PLATFORM_KEY.get(normalized_key, "hermes-telegram")
+    return [default_toolset]
+
+
+def _compose_auto_preload_ephemeral(
+    base_prompt: str | None,
+    platform_key: str | None,
+    user_message: str | None,
+    task_id: str | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Append config-driven auto-preloaded skills to an ephemeral prompt."""
+    combined_prompt = (base_prompt or "").strip()
+    try:
+        from agent.skill_commands import build_auto_preloaded_skills_prompt
+        from hermes_cli.config import load_config as _load_hermes_config
+
+        auto_prompt, auto_loaded, auto_missing = build_auto_preloaded_skills_prompt(
+            _load_hermes_config(),
+            _resolve_platform_config_key(platform_key),
+            user_message,
+            task_id=task_id,
+        )
+    except Exception as exc:
+        logger.debug("Could not resolve auto-preloaded skills: %s", exc)
+        return combined_prompt, [], []
+
+    if auto_prompt:
+        combined_prompt = "\n\n".join(
+            part for part in (combined_prompt, auto_prompt) if part
+        ).strip()
+    return combined_prompt, auto_loaded, auto_missing
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
@@ -3318,49 +3419,8 @@ class GatewayRunner:
             # Read model from config via shared helper
             model = _resolve_gateway_model()
 
-            # Determine toolset (same logic as _run_agent)
-            default_toolset_map = {
-                Platform.LOCAL: "hermes-cli",
-                Platform.TELEGRAM: "hermes-telegram",
-                Platform.DISCORD: "hermes-discord",
-                Platform.WHATSAPP: "hermes-whatsapp",
-                Platform.SLACK: "hermes-slack",
-                Platform.SIGNAL: "hermes-signal",
-                Platform.HOMEASSISTANT: "hermes-homeassistant",
-                Platform.EMAIL: "hermes-email",
-                Platform.DINGTALK: "hermes-dingtalk",
-            }
-            platform_toolsets_config = {}
-            try:
-                config_path = _hermes_home / 'config.yaml'
-                if config_path.exists():
-                    import yaml
-                    with open(config_path, 'r', encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                    platform_toolsets_config = user_config.get("platform_toolsets", {})
-            except Exception:
-                pass
-
-            platform_config_key = {
-                Platform.LOCAL: "cli",
-                Platform.TELEGRAM: "telegram",
-                Platform.DISCORD: "discord",
-                Platform.WHATSAPP: "whatsapp",
-                Platform.SLACK: "slack",
-                Platform.SIGNAL: "signal",
-                Platform.HOMEASSISTANT: "homeassistant",
-                Platform.EMAIL: "email",
-                Platform.DINGTALK: "dingtalk",
-            }.get(source.platform, "telegram")
-
-            config_toolsets = platform_toolsets_config.get(platform_config_key)
-            if config_toolsets and isinstance(config_toolsets, list):
-                enabled_toolsets = config_toolsets
-            else:
-                default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
-                enabled_toolsets = [default_toolset]
-
-            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+            platform_key = _resolve_platform_config_key(source.platform)
+            enabled_toolsets = _resolve_platform_enabled_toolsets(platform_key)
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -4426,52 +4486,8 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
         
-        # Determine toolset based on platform.
-        # Check config.yaml for per-platform overrides, fallback to hardcoded defaults.
-        default_toolset_map = {
-            Platform.LOCAL: "hermes-cli",
-            Platform.TELEGRAM: "hermes-telegram",
-            Platform.DISCORD: "hermes-discord",
-            Platform.WHATSAPP: "hermes-whatsapp",
-            Platform.SLACK: "hermes-slack",
-            Platform.SIGNAL: "hermes-signal",
-            Platform.HOMEASSISTANT: "hermes-homeassistant",
-            Platform.EMAIL: "hermes-email",
-            Platform.DINGTALK: "hermes-dingtalk",
-        }
-
-        # Try to load platform_toolsets from config
-        platform_toolsets_config = {}
-        try:
-            config_path = _hermes_home / 'config.yaml'
-            if config_path.exists():
-                import yaml
-                with open(config_path, 'r', encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-                platform_toolsets_config = user_config.get("platform_toolsets", {})
-        except Exception as e:
-            logger.debug("Could not load platform_toolsets config: %s", e)
-
-        # Map platform enum to config key
-        platform_config_key = {
-            Platform.LOCAL: "cli",
-            Platform.TELEGRAM: "telegram",
-            Platform.DISCORD: "discord",
-            Platform.WHATSAPP: "whatsapp",
-            Platform.SLACK: "slack",
-            Platform.SIGNAL: "signal",
-            Platform.HOMEASSISTANT: "homeassistant",
-            Platform.EMAIL: "email",
-            Platform.DINGTALK: "dingtalk",
-        }.get(source.platform, "telegram")
-        
-        # Use config override if present (list of toolsets), otherwise hardcoded default
-        config_toolsets = platform_toolsets_config.get(platform_config_key)
-        if config_toolsets and isinstance(config_toolsets, list):
-            enabled_toolsets = config_toolsets
-        else:
-            default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
-            enabled_toolsets = [default_toolset]
+        platform_key = _resolve_platform_config_key(source.platform)
+        enabled_toolsets = _resolve_platform_enabled_toolsets(platform_key)
         
         # Tool progress mode from config.yaml: "summary", "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
@@ -4700,41 +4716,28 @@ class GatewayRunner:
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             
-            # Map platform enum to the platform hint key the agent understands.
-            # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
-            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
-            
             # Combine platform context with user-configured ephemeral system prompt
             combined_ephemeral = context_prompt or ""
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
-            try:
-                from agent.skill_commands import build_auto_preloaded_skills_prompt
-                from hermes_cli.config import load_config as _load_hermes_config
-
-                auto_prompt, auto_loaded, auto_missing = build_auto_preloaded_skills_prompt(
-                    _load_hermes_config(),
+            combined_ephemeral, auto_loaded, auto_missing = _compose_auto_preload_ephemeral(
+                combined_ephemeral,
+                platform_key,
+                message,
+                task_id=session_id,
+            )
+            if auto_missing:
+                logger.warning(
+                    "Auto-preloaded skill(s) not found for %s: %s",
                     platform_key,
-                    message,
-                    task_id=session_id,
+                    ", ".join(auto_missing),
                 )
-                if auto_missing:
-                    logger.warning(
-                        "Auto-preloaded skill(s) not found for %s: %s",
-                        platform_key,
-                        ", ".join(auto_missing),
-                    )
-                if auto_prompt:
-                    combined_ephemeral = "\n\n".join(
-                        part for part in (combined_ephemeral, auto_prompt) if part
-                    ).strip()
-                    logger.info(
-                        "Auto-preloaded skills for %s: %s",
-                        platform_key,
-                        ", ".join(auto_loaded),
-                    )
-            except Exception as _auto_skill_exc:
-                logger.debug("Could not resolve auto-preloaded skills: %s", _auto_skill_exc)
+            if auto_loaded:
+                logger.info(
+                    "Auto-preloaded skills for %s: %s",
+                    platform_key,
+                    ", ".join(auto_loaded),
+                )
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
