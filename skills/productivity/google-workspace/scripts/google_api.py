@@ -8,7 +8,9 @@ Usage:
   python google_api.py gmail search "is:unread" [--max 10]
   python google_api.py gmail get MESSAGE_ID
   python google_api.py gmail send --to user@example.com --subject "Hi" --body "Hello"
+  python google_api.py gmail send --to user@example.com --subject "Report" --body-file /tmp/report.html --attachment /tmp/chart.png
   python google_api.py gmail reply MESSAGE_ID --body "Thanks"
+  python google_api.py gmail reply MESSAGE_ID --body-file /tmp/reply.html --attachment /tmp/data.csv
   python google_api.py calendar list [--from DATE] [--to DATE] [--calendar primary]
   python google_api.py calendar create --summary "Meeting" --start DATETIME --end DATETIME
   python google_api.py drive search "budget report" [--max 10]
@@ -25,6 +27,10 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+import mimetypes
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -88,6 +94,49 @@ def build_service(api, version, token_path=None):
 # =========================================================================
 # Gmail
 # =========================================================================
+
+def _read_body(args):
+    """Return body text from --body or --body-file."""
+    if getattr(args, "body_file", None):
+        return Path(args.body_file).read_text(encoding="utf-8")
+    return args.body
+
+
+def build_mime_message(
+    body: str,
+    *,
+    html: bool = False,
+    attachment_path: str | None = None,
+) -> MIMEBase:
+    """Build a MIME message, optionally with an attachment.
+
+    Returns MIMEText when there is no attachment, MIMEMultipart when there is.
+    """
+    subtype = "html" if html else "plain"
+    text_part = MIMEText(body, subtype)
+
+    if not attachment_path:
+        return text_part
+
+    msg = MIMEMultipart()
+    msg.attach(text_part)
+
+    file_path = Path(attachment_path)
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if content_type is None:
+        content_type = "application/octet-stream"
+    maintype, subtype = content_type.split("/", 1)
+
+    with open(file_path, "rb") as f:
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(f.read())
+    encoders.encode_base64(part)
+    part.add_header(
+        "Content-Disposition", "attachment", filename=file_path.name,
+    )
+    msg.attach(part)
+    return msg
+
 
 def gmail_search(args):
     service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
@@ -158,19 +207,24 @@ def gmail_get(args):
 
 def gmail_send(args):
     service = build_service("gmail", "v1", GMAIL_TOKEN_PATH)
-    message = MIMEText(args.body, "html" if args.html else "plain")
+    body_text = _read_body(args)
+    message = build_mime_message(
+        body_text,
+        html=args.html,
+        attachment_path=getattr(args, "attachment", None),
+    )
     message["to"] = args.to
     message["subject"] = args.subject
     if args.cc:
         message["cc"] = args.cc
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    body = {"raw": raw}
+    payload = {"raw": raw}
 
     if args.thread_id:
-        body["threadId"] = args.thread_id
+        payload["threadId"] = args.thread_id
 
-    result = service.users().messages().send(userId="me", body=body).execute()
+    result = service.users().messages().send(userId="me", body=payload).execute()
     print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
 
 
@@ -187,7 +241,11 @@ def gmail_reply(args):
     if not subject.startswith("Re:"):
         subject = f"Re: {subject}"
 
-    message = MIMEText(args.body)
+    body_text = _read_body(args)
+    message = build_mime_message(
+        body_text,
+        attachment_path=getattr(args, "attachment", None),
+    )
     message["to"] = headers.get("From", "")
     message["subject"] = subject
     if headers.get("Message-ID"):
@@ -195,9 +253,9 @@ def gmail_reply(args):
         message["References"] = headers["Message-ID"]
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    body = {"raw": raw, "threadId": original["threadId"]}
+    payload = {"raw": raw, "threadId": original["threadId"]}
 
-    result = service.users().messages().send(userId="me", body=body).execute()
+    result = service.users().messages().send(userId="me", body=payload).execute()
     print(json.dumps({"status": "sent", "id": result["id"], "threadId": result.get("threadId", "")}, indent=2))
 
 
@@ -443,15 +501,21 @@ def main():
     p = gmail_sub.add_parser("send")
     p.add_argument("--to", required=True)
     p.add_argument("--subject", required=True)
-    p.add_argument("--body", required=True)
+    body_group = p.add_mutually_exclusive_group(required=True)
+    body_group.add_argument("--body", help="Inline body text")
+    body_group.add_argument("--body-file", dest="body_file", help="Path to file with body content")
     p.add_argument("--cc", default="")
     p.add_argument("--html", action="store_true", help="Send body as HTML")
     p.add_argument("--thread-id", default="", help="Thread ID for threading")
+    p.add_argument("--attachment", help="Path to file to attach")
     p.set_defaults(func=gmail_send)
 
     p = gmail_sub.add_parser("reply")
     p.add_argument("message_id", help="Message ID to reply to")
-    p.add_argument("--body", required=True)
+    body_group = p.add_mutually_exclusive_group(required=True)
+    body_group.add_argument("--body", help="Inline body text")
+    body_group.add_argument("--body-file", dest="body_file", help="Path to file with body content")
+    p.add_argument("--attachment", help="Path to file to attach")
     p.set_defaults(func=gmail_reply)
 
     p = gmail_sub.add_parser("labels")
